@@ -42,6 +42,11 @@ annotate() {
 fail() {
   echo "ERROR: $1" >&2
   annotate error "ECS deploy of $ECS_SERVICE ($ECS_CLUSTER) failed: $1"
+  case "$1" in
+    *"cluster was inactive"*|*ClusterNotFoundException*|*"not found"*|*"deleted or being deleted"*|*MissingParameter*)
+      annotate error "$ECS_CLUSTER does not exist or is being deleted: the Terraform-managed infrastructure was destroyed. Run the Terraform workflow (action=apply) to recreate it, then re-run CI."
+      ;;
+  esac
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
       printf '### ECS deploy failure - %s\n\n```text\n%s%s\n```\n\n' \
@@ -69,6 +74,21 @@ aws_run() {
     fail "$_label (aws exit $_rc): $_detail"
   fi
 }
+
+# Fail before registering anything if the cluster is gone: ECS keeps deleted
+# clusters around as INACTIVE, where describes still work but update-service
+# throws "ClusterNotFoundException: The referenced cluster was inactive", which
+# reads like a permissions bug rather than "your infrastructure was destroyed".
+echo "Checking status of cluster $ECS_CLUSTER..."
+aws_run "describe-clusters" ecs describe-clusters \
+  --clusters "$ECS_CLUSTER" --query 'clusters[0].status' --output text
+CLUSTER_STATUS=$(tr -d ' \t\n' < "$AWS_OUT")
+case "$CLUSTER_STATUS" in
+  ACTIVE) ;;
+  "")   fail "cluster '$ECS_CLUSTER' was not found in this AWS account" ;;
+  None) fail "cluster '$ECS_CLUSTER' was not found in this AWS account" ;;
+  *)    fail "cluster '$ECS_CLUSTER' has status $CLUSTER_STATUS (deleted or being deleted)" ;;
+esac
 
 echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
 aws_run "describe-services" ecs describe-services \
