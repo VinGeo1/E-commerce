@@ -23,45 +23,80 @@ set -eu
 CONTAINER_NAME="${CONTAINER_NAME:-}"
 WAIT_FOR_STABLE="${WAIT_FOR_STABLE:-0}"
 
-for cmd in aws jq; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: '$cmd' is not installed"; exit 1; }
-done
-
 WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 CURRENT="$WORKDIR/current.json"
 NEW="$WORKDIR/new.json"
+AWS_OUT="$WORKDIR/out.txt"
+AWS_ERR="$WORKDIR/err.txt"
+
+# Failures have to be visible outside the job log: on Actions, surface them as a
+# check annotation (and job summary) so tooling/CI consumers can read the reason.
+annotate() {
+  [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+  # Workflow commands must stay on one line; '%' has to be escaped as %25.
+  _msg=$(printf '%s' "$2" | tr -d '\r' | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-900)
+  printf '::%s::%s\n' "$1" "$_msg"
+}
+
+fail() {
+  echo "ERROR: $1" >&2
+  annotate error "ECS deploy of $ECS_SERVICE ($ECS_CLUSTER) failed: $1"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+      printf '### ECS deploy failure - %s\n\n```text\n%s%s\n```\n\n' \
+        "$ECS_SERVICE" "$(tr '\n' ' ' < "$AWS_ERR" 2>/dev/null)" "\n"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+  exit 1
+}
+
+for cmd in aws jq; do
+  command -v "$cmd" >/dev/null 2>&1 || fail "'$cmd' is not installed on this runner"
+done
+
+# aws_run <label> <aws args...>  - stdout lands in $AWS_OUT, stderr in $AWS_ERR.
+aws_run() {
+  _label=$1; shift
+  : > "$AWS_OUT"; : > "$AWS_ERR"
+  set +e
+  aws "$@" > "$AWS_OUT" 2> "$AWS_ERR"
+  _rc=$?
+  set -e
+  if [ "$_rc" -ne 0 ]; then
+    _detail=$(tr '\n' ' ' < "$AWS_ERR" | tr -s ' ' | cut -c1-700)
+    [ -n "$_detail" ] || _detail=$(tr '\n' ' ' < "$AWS_OUT" | tr -s ' ' | cut -c1-700)
+    fail "$_label (aws exit $_rc): $_detail"
+  fi
+}
 
 echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
-TASK_DEF_ARN=$(aws ecs describe-services \
+aws_run "describe-services" ecs describe-services \
   --cluster "$ECS_CLUSTER" \
   --services "$ECS_SERVICE" \
   --query 'services[0].taskDefinition' \
-  --output text 2>/dev/null || true)
+  --output text
+TASK_DEF_ARN=$(tr -d ' \t\n' < "$AWS_OUT")
 
 if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
-  echo "ERROR: Service '$ECS_SERVICE' or cluster '$ECS_CLUSTER' not found in AWS ECS."
-  echo "Please run the Terraform workflow (apply action) first to provision the infrastructure."
-  exit 1
+  fail "service '$ECS_SERVICE' not found in cluster '$ECS_CLUSTER' - run the Terraform workflow (apply) first to provision the infrastructure"
 fi
 echo "Current task def: $TASK_DEF_ARN"
 
-aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" \
-  --query 'taskDefinition' --output json > "$CURRENT"
+aws_run "describe-task-definition" ecs describe-task-definition \
+  --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json
 
 if ! jq -e 'type == "object" and (.family | type == "string")
-            and (.containerDefinitions | type == "array" and length > 0)' "$CURRENT" > /dev/null; then
-  echo "ERROR: unexpected describe-task-definition response; refusing to register a new revision."
-  cat "$CURRENT"
-  exit 1
+            and (.containerDefinitions | type == "array" and length > 0)' \
+  "$AWS_OUT" > /dev/null; then
+  fail "unexpected describe-task-definition response; refusing to register a new revision"
 fi
+cp "$AWS_OUT" "$CURRENT"
 
 if [ -n "$CONTAINER_NAME" ]; then
   if ! jq -e --arg CN "$CONTAINER_NAME" \
     '[.containerDefinitions[] | select(.name == $CN)] | length > 0' "$CURRENT" > /dev/null; then
-    echo "ERROR: container '$CONTAINER_NAME' not found in $TASK_DEF_ARN. Containers present:"
-    jq -r '.containerDefinitions | map(.name) | join(", ")' "$CURRENT"
-    exit 1
+    fail "container '$CONTAINER_NAME' not found in $TASK_DEF_ARN (containers: $(jq -r '.containerDefinitions | map(.name) | join(", ")' "$CURRENT"))"
   fi
 fi
 
@@ -101,34 +136,45 @@ end
 | with_entries(select(.value != null and .value != [] and .value != {}))
 JQ
 
-jq -c -f "$WORKDIR/filter.jq" \
+if ! jq -c -f "$WORKDIR/filter.jq" \
   --arg IMG "$IMAGE" --arg CN "$CONTAINER_NAME" --argjson IS_EC2 "$IS_EC2" \
-  "$CURRENT" > "$NEW"
-
-# Never register a revision that would start the old image.
-if ! jq -e --arg IMG "$IMAGE" \
-  '[.containerDefinitions[].image] | index($IMG) != null' "$NEW" > /dev/null; then
-  echo "ERROR: image '$IMAGE' was not applied to the task definition."
-  jq '.containerDefinitions | map({name, image})' "$NEW"
-  exit 1
+  "$CURRENT" > "$NEW"; then
+  fail "could not build the new task definition payload"
 fi
 
+# Never register a revision that would restart the old image.
+if ! jq -e --arg IMG "$IMAGE" \
+  '[.containerDefinitions[].image] | index($IMG) != null' "$NEW" > /dev/null; then
+  fail "image '$IMAGE' was not applied to the task definition"
+fi
+
+PAYLOAD_SUMMARY="payload for $TASK_DEF_ARN -> family=$(jq -r '.family' "$NEW") keys=$(jq -r 'keys_unsorted | join(",")' "$NEW")"
+echo "$PAYLOAD_SUMMARY"
+annotate notice "$PAYLOAD_SUMMARY"
+
 echo "Registering new task definition revision for image: $IMAGE"
-NEW_ARN=$(aws ecs register-task-definition --cli-input-json "file://$NEW" \
-  --query 'taskDefinition.taskDefinitionArn' --output text)
+aws_run "register-task-definition" ecs register-task-definition \
+  --cli-input-json "file://$NEW" \
+  --query 'taskDefinition.taskDefinitionArn' --output text
+NEW_ARN=$(tr -d ' \t\n' < "$AWS_OUT")
+[ -n "$NEW_ARN" ] && [ "$NEW_ARN" != "None" ] || fail "register-task-definition returned no task definition ARN"
 echo "New task def: $NEW_ARN"
 
-aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
-  --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
-echo "Rollout triggered for $ECS_SERVICE"
+aws_run "update-service" ecs update-service \
+  --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+  --task-definition "$NEW_ARN" --force-new-deployment
+echo "Rollout triggered for $ECS_SERVICE on $NEW_ARN"
 
 if [ "$WAIT_FOR_STABLE" = "1" ]; then
   echo "Waiting for $ECS_SERVICE to reach steady state (up to ~10 min)..."
-  if ! aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"; then
-    echo "ERROR: service $ECS_SERVICE did not stabilise. Recent service events:"
+  set +e
+  aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+  _rc=$?
+  set -e
+  if [ "$_rc" -ne 0 ]; then
     aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-      --query 'services[0].events[:10].[createdAt,message]' --output table || true
-    exit 1
+      --query 'services[0].events[:10].[createdAt,message]' --output table >&2 || true
+    fail "service $ECS_SERVICE did not stabilise on $NEW_ARN (see service events above)"
   fi
   echo "Service $ECS_SERVICE is stable."
 fi
