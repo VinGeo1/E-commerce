@@ -15,14 +15,6 @@ resource "aws_security_group" "ecs_instance" {
     security_groups = [aws_security_group.alb.id]
   }
 
-  ingress {
-    description = "SSH (optional, tighten to your IP)"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
   egress {
     from_port   = 0
     to_port     = 0
@@ -44,9 +36,18 @@ resource "aws_launch_template" "ecs" {
 
   user_data = base64encode(<<-EOT
     #!/bin/bash
-    echo "ECS_CLUSTER=ecommerce-cluster" >> /etc/ecs/ecs.config
-    echo "ECS_ENABLE_CONTAINER_METADATA=true" >> /etc/ecs/ecs.config
-    systemctl enable --now ecs
+    set -euxo pipefail
+
+    cat > /etc/ecs/ecs.config <<'CONF'
+    ECS_CLUSTER=ecommerce-cluster
+    ECS_ENABLE_CONTAINER_METADATA=true
+    ECS_LOGLEVEL=info
+    CONF
+
+    systemctl enable ecs
+    systemctl start ecs
+
+    echo "user_data completed at $(date)" >> /var/log/ecs/user_data.log
   EOT
   )
 }
