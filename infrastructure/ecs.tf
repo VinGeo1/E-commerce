@@ -33,7 +33,18 @@ resource "aws_launch_template" "ecs" {
   vpc_security_group_ids = [aws_security_group.ecs_instance.id]
   user_data = base64encode(<<-EOT
     #!/bin/bash
-    echo ECS_CLUSTER=ecommerce-cluster >> /etc/ecs/ecs.config
+    set -euxo pipefail
+
+    cat > /etc/ecs/ecs.config <<'CONF'
+    ECS_CLUSTER=ecommerce-cluster
+    ECS_ENABLE_CONTAINER_METADATA=true
+    ECS_LOGLEVEL=info
+    CONF
+
+    systemctl enable ecs
+    systemctl start ecs
+
+    echo "user_data completed at $(date)" >> /var/log/ecs/user_data.log
   EOT
   )
 }
