@@ -1,4 +1,4 @@
-# E-Commerce Application
+# E-Commerce Application 
 
 A full-stack e-commerce application with a Java backend and React frontend, deployed on AWS ECS with an Application Load Balancer.
 
