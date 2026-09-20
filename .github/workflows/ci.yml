@@ -26,13 +26,11 @@ jobs:
 
       - name: Validate required variables
         env:
-          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-          ALB_DNS: ${{ secrets.ALB_DNS }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "MISSING: AWS_ACCOUNT_ID"; exit 1; fi
-          if [ -z "$AWS_DEFAULT_REGION" ]; then echo "MISSING: AWS_DEFAULT_REGION"; exit 1; fi
-          if [ -z "$ALB_DNS" ]; then echo "MISSING: ALB_DNS"; exit 1; fi
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then echo "MISSING: AWS_ACCESS_KEY_ID"; exit 1; fi
+          if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then echo "MISSING: AWS_SECRET_ACCESS_KEY"; exit 1; fi
           echo "All required CI variables present."
 
   build-and-push-backend:
