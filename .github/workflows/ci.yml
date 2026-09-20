@@ -96,7 +96,9 @@ jobs:
   deploy-backend:
     needs: [build-and-push-backend]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    # Deploys on every push to main; manual runs also deploy (from whatever ref
+    # they were dispatched on) so a deploy can be triggered without merging first.
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
@@ -112,29 +114,12 @@ jobs:
           ECS_CLUSTER: ecommerce-cluster
           ECS_SERVICE: backend-service
           IMAGE: ${{ needs.build-and-push-backend.outputs.registry }}/ecommerce-backend:${{ github.sha }}
-        run: |
-          set -e
-          if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
-          if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
-          echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
-          TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text 2>/dev/null || true)
-          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
-            echo "ERROR: Service '$ECS_SERVICE' or cluster '$ECS_CLUSTER' not found in AWS ECS."
-            echo "Please run the Terraform workflow (apply action) first to provision the infrastructure."
-            exit 1
-          fi
-          echo "Current task def: $TASK_DEF_ARN"
-          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
-          jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
-          NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
-          echo "New task def: $NEW_ARN"
-          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
-          echo "Rollout triggered for $ECS_SERVICE"
+        run: sh scripts/ecs-deploy.sh
 
   deploy-frontend:
     needs: [build-and-push-frontend]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
@@ -150,21 +135,4 @@ jobs:
           ECS_CLUSTER: ecommerce-cluster
           ECS_SERVICE: frontend-service
           IMAGE: ${{ needs.build-and-push-frontend.outputs.registry }}/ecommerce-frontend:${{ github.sha }}
-        run: |
-          set -e
-          if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
-          if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
-          echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
-          TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text 2>/dev/null || true)
-          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
-            echo "ERROR: Service '$ECS_SERVICE' or cluster '$ECS_CLUSTER' not found in AWS ECS."
-            echo "Please run the Terraform workflow (apply action) first to provision the infrastructure."
-            exit 1
-          fi
-          echo "Current task def: $TASK_DEF_ARN"
-          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
-          jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
-          NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
-          echo "New task def: $NEW_ARN"
-          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
-          echo "Rollout triggered for $ECS_SERVICE"
+        run: sh scripts/ecs-deploy.sh
