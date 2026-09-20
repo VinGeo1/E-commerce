@@ -1,0 +1,4596 @@
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..af3f2f0
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,4 @@
++* text=auto eol=lf
++*.png binary
++*.jpg binary
++*.jar binary
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2b8c777..c917a83 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -2,18 +2,19 @@ name: CI
+ 
+ on:
+   push:
+-    branches: [ main ]
++    branches: [main]
+   pull_request:
+-    branches: [ main ]
++    branches: [main]
+   workflow_dispatch:
+ 
+ permissions:
+   contents: read
+ 
+ env:
+-  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+-  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+-  ECR_REGISTRY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_DEFAULT_REGION }}.amazonaws.com
++  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
++  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID || '414100287492' }}
++  ECR_REGISTRY: ${{ vars.AWS_ACCOUNT_ID || '414100287492' }}.dkr.ecr.${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}.amazonaws.com
++  ECS_CLUSTER: ecommerce-cluster
+ 
+ jobs:
+   validate:
+@@ -21,39 +22,37 @@ jobs:
+     steps:
+       - uses: actions/checkout@v4
+ 
+-      - name: Configure AWS credentials
+-        uses: aws-actions/configure-aws-credentials@v4
+-        with:
+-          aws-region: us-east-1
+-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+-
+-      - name: Validate required config
++      - name: Validate config
+         env:
+           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+         run: |
+-          if [ -z "$AWS_ACCESS_KEY_ID" ]; then echo "MISSING: AWS_ACCESS_KEY_ID"; exit 1; fi
+-          if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then echo "MISSING: AWS_SECRET_ACCESS_KEY"; exit 1; fi
+-          echo "All required CI variables present."
++          set -e
++          missing=""
++          for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION AWS_ACCOUNT_ID; do
++            # bash indirect expansion: ${!v} is the value of the variable named $v
++            if [ -z "${!v}" ]; then missing="$missing $v"; fi
++          done
++          if [ -n "$missing" ]; then
++            echo "::error::Missing required CI configuration:$missing (secrets in Settings > Secrets and variables > Actions, variables in the same place)"
++            exit 1
++          fi
++          echo "All required config present."
+ 
+   build-and-push-backend:
+     needs: validate
+     runs-on: ubuntu-latest
+-    outputs:
+-      registry: ${{ steps.login-ecr.outputs.registry }}
+     steps:
+       - uses: actions/checkout@v4
+ 
+-      - name: Configure AWS credentials
+-        uses: aws-actions/configure-aws-credentials@v4
++      - uses: aws-actions/configure-aws-credentials@v4
+         with:
+-          aws-region: us-east-1
+           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+ 
+       - name: Login to Amazon ECR
+-        id: login-ecr
++        id: ecr
+         uses: aws-actions/amazon-ecr-login@v2
+ 
+       - name: Build and push backend image
+@@ -68,20 +67,17 @@ jobs:
+   build-and-push-frontend:
+     needs: validate
+     runs-on: ubuntu-latest
+-    outputs:
+-      registry: ${{ steps.login-ecr.outputs.registry }}
+     steps:
+       - uses: actions/checkout@v4
+ 
+-      - name: Configure AWS credentials
+-        uses: aws-actions/configure-aws-credentials@v4
++      - uses: aws-actions/configure-aws-credentials@v4
+         with:
+-          aws-region: us-east-1
+           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+ 
+       - name: Login to Amazon ECR
+-        id: login-ecr
++        id: ecr
+         uses: aws-actions/amazon-ecr-login@v2
+ 
+       - name: Build and push frontend image
+@@ -93,78 +89,73 @@ jobs:
+             ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
+             ${{ env.ECR_REGISTRY }}/ecommerce-frontend:latest
+ 
++  # The two deploy jobs intentionally share scripts/ecs-deploy.sh: it rebuilds the
++  # register payload from the arguments RegisterTaskDefinition accepts instead of
++  # deleting a fixed list of read-only fields, and it fails with a check annotation
++  # that says *why* (missing service, inactive cluster, IAM, ...).
++  # WAIT_FOR_STABLE makes "green pipeline, 0 running tasks" impossible: the job only
++  # passes once the service reports steady state, and a failed rollout is followed by
++  # scripts/ecs-diagnose.sh (read-only) printing capacity / stopped-task / target health.
+   deploy-backend:
+-    needs: [build-and-push-backend]
++    needs: build-and-push-backend
+     runs-on: ubuntu-latest
+-    if: github.ref == 'refs/heads/main'
++    timeout-minutes: 25
++    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+     steps:
+       - uses: actions/checkout@v4
+ 
+-      - name: Configure AWS credentials
+-        uses: aws-actions/configure-aws-credentials@v4
++      - uses: aws-actions/configure-aws-credentials@v4
+         with:
+-          aws-region: us-east-1
+           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+ 
+-      - name: Deploy backend service
++      - name: Update ECS service
+         env:
+-          ECS_CLUSTER: ecommerce-cluster
+           ECS_SERVICE: backend-service
+-          IMAGE: ${{ needs.build-and-push-backend.outputs.registry }}/ecommerce-backend:${{ github.sha }}
+-        run: |
+-          set -e
+-          if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
+-          if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
+-          echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
+-          TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text 2>/dev/null || true)
+-          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
+-            echo "ERROR: Service '$ECS_SERVICE' or cluster '$ECS_CLUSTER' not found in AWS ECS."
+-            echo "Please run the Terraform workflow (apply action) first to provision the infrastructure."
+-            exit 1
+-          fi
+-          echo "Current task def: $TASK_DEF_ARN"
+-          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
+-          jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
+-          NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+-          echo "New task def: $NEW_ARN"
+-          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
+-          echo "Rollout triggered for $ECS_SERVICE"
++          CONTAINER_NAME: backend
++          IMAGE: ${{ env.ECR_REGISTRY }}/ecommerce-backend:${{ github.sha }}
++          # Fail the job unless the task actually reaches steady state: "registered a
++          # new revision" is not the same as "the service is running it".
++          WAIT_FOR_STABLE: 1
++        run: sh scripts/ecs-deploy.sh
++
++      # Only on failure, and only reads: prints cluster capacity, stopped-task
++      # reasons and ALB target health so the log says *why* nothing is running.
++      - name: Triage (read-only)
++        if: failure()
++        env:
++          ECS_CLUSTER: ecommerce-cluster
++        run: sh scripts/ecs-diagnose.sh backend-service
+ 
+   deploy-frontend:
+-    needs: [build-and-push-frontend]
++    needs: build-and-push-frontend
+     runs-on: ubuntu-latest
+-    if: github.ref == 'refs/heads/main'
++    timeout-minutes: 25
++    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+     steps:
+       - uses: actions/checkout@v4
+ 
+-      - name: Configure AWS credentials
+-        uses: aws-actions/configure-aws-credentials@v4
++      - uses: aws-actions/configure-aws-credentials@v4
+         with:
+-          aws-region: us-east-1
+           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+ 
+-      - name: Deploy frontend service
++      - name: Update ECS service
+         env:
+-          ECS_CLUSTER: ecommerce-cluster
+           ECS_SERVICE: frontend-service
+-          IMAGE: ${{ needs.build-and-push-frontend.outputs.registry }}/ecommerce-frontend:${{ github.sha }}
+-        run: |
+-          set -e
+-          if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
+-          if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
+-          echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
+-          TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text 2>/dev/null || true)
+-          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
+-            echo "ERROR: Service '$ECS_SERVICE' or cluster '$ECS_CLUSTER' not found in AWS ECS."
+-            echo "Please run the Terraform workflow (apply action) first to provision the infrastructure."
+-            exit 1
+-          fi
+-          echo "Current task def: $TASK_DEF_ARN"
+-          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
+-          jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
+-          NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+-          echo "New task def: $NEW_ARN"
+-          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
+-          echo "Rollout triggered for $ECS_SERVICE"
++          CONTAINER_NAME: frontend
++          IMAGE: ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
++          # Fail the job unless the task actually reaches steady state: "registered a
++          # new revision" is not the same as "the service is running it".
++          WAIT_FOR_STABLE: 1
++        run: sh scripts/ecs-deploy.sh
++
++      # Only on failure, and only reads: prints cluster capacity, stopped-task
++      # reasons and ALB target health so the log says *why* nothing is running.
++      - name: Triage (read-only)
++        if: failure()
++        env:
++          ECS_CLUSTER: ecommerce-cluster
++        run: sh scripts/ecs-diagnose.sh frontend-service
+diff --git a/.github/workflows/terraform.yml b/.github/workflows/terraform.yml
+index 69591d8..446a5f6 100644
+--- a/.github/workflows/terraform.yml
++++ b/.github/workflows/terraform.yml
+@@ -4,61 +4,138 @@ on:
+   workflow_dispatch:
+     inputs:
+       action:
+-        description: 'Terraform action to run'
++        description: 'Terraform action'
+         required: true
+         default: 'plan'
++        type: choice
+         options:
+           - plan
+           - apply
+           - destroy
+       db_password:
+-        description: 'Database password (required for apply)'
++        description: 'Postgres password. Leave empty to use the DB_PASSWORD repository secret.'
+         required: false
+         type: string
+       confirmation:
+-        description: 'Type "DESTROY" to confirm destruction'
++        description: 'Type DESTROY to confirm destroy'
+         required: false
+         type: string
+ 
++permissions:
++  contents: read
++
++# State now lives in S3 behind a DynamoDB lock: a second apply would only queue up
++# behind that lock anyway, and cancelling a half-finished apply/destroy is how state
++# gets corrupted. Serialise runs instead of cancelling them.
++concurrency:
++  group: terraform-prod
++  cancel-in-progress: false
++
++env:
++  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION || 'us-east-1' }}
++  TF_IN_AUTOMATION: 'true'
++
+ jobs:
+   terraform:
+     runs-on: ubuntu-latest
+-    if: |
+-      github.event.inputs.action != 'destroy' ||
+-      (github.event.inputs.action == 'destroy' && github.event.inputs.confirmation == 'DESTROY')
++    env:
++      TF_STATE_BUCKET: ecommerce-tfstate-414100287492
++
+     steps:
+       - name: Checkout code
+         uses: actions/checkout@v4
+ 
++      - name: Refuse destroy without confirmation
++        if: github.event.inputs.action == 'destroy' && github.event.inputs.confirmation != 'DESTROY'
++        run: |
++          echo "ERROR: You must type DESTROY in the confirmation field to run destroy mode."
++          exit 1
++
+       - name: Configure AWS credentials
+         uses: aws-actions/configure-aws-credentials@v4
+         with:
+-          aws-region: us-east-1
+           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: ${{ env.AWS_DEFAULT_REGION }}
++
++      # db_password was a dispatch-only input before, so it landed in the runner
++      # environment and on the terraform command line. Preferred setup: store it as
++      # the DB_PASSWORD repository secret and leave the input empty.
++      - name: Validate required config
++        env:
++          TF_VAR_db_password: ${{ github.event.inputs.db_password != '' && github.event.inputs.db_password || secrets.DB_PASSWORD }}
++        run: |
++          set -e
++          missing=""
++          [ -n "${AWS_ACCESS_KEY_ID:-}" ] || missing="$missing AWS_ACCESS_KEY_ID"
++          [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || missing="$missing AWS_SECRET_ACCESS_KEY"
++          # -input=false turns an unset required variable into a confusing mid-plan
++          # "no value included for a required variable" error; catch it up front.
++          [ -n "${TF_VAR_db_password:-}" ] || missing="$missing db_password(input or DB_PASSWORD secret)"
++          if [ -n "$missing" ]; then
++            echo "::error::Missing required CI configuration:$missing"
++            exit 1
++          fi
++          # Fail here rather than 30s later inside `terraform init`, whose backend
++          # error is easy to misread. A 403 (key without s3:ListBucket) is only a
++          # warning: init can still work with object-level permissions.
++          head_out=$(aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>&1) || {
++            case "$head_out" in
++              *NotFound*|*NoSuchBucket*)
++                echo "::error::State bucket $TF_STATE_BUCKET does not exist - create it first (README: Terraform state)."
++                exit 1
++                ;;
++              *)
++                echo "::warning::could not verify $TF_STATE_BUCKET: $head_out"
++                ;;
++            esac
++          }
++          echo "AWS credentials, state bucket and db password look OK."
+ 
+       - name: Setup Terraform
+         uses: hashicorp/setup-terraform@v3
+         with:
+-          terraform_version: 1.5.0
++          terraform_version: 1.9.5
+ 
+       - name: Terraform Init
+-        run: terraform -chdir=infrastructure init -input=false
++        working-directory: infrastructure
++        run: terraform init -input=false
+ 
+       - name: Terraform Format
+-        run: terraform -chdir=infrastructure fmt -check
++        working-directory: infrastructure
++        run: terraform fmt -check
+ 
+       - name: Terraform Validate
+-        run: terraform -chdir=infrastructure validate
++        working-directory: infrastructure
++        run: terraform validate
+ 
+       - name: Terraform Plan
+-        if: github.event.inputs.action == 'plan'
+-        run: terraform -chdir=infrastructure plan -input=false -var="db_password=${{ github.event.inputs.db_password }}"
++        if: github.event.inputs.action != 'destroy'
++        working-directory: infrastructure
++        env:
++          TF_VAR_db_password: ${{ github.event.inputs.db_password != '' && github.event.inputs.db_password || secrets.DB_PASSWORD }}
++        run: terraform plan -input=false -no-color
+ 
+       - name: Terraform Apply
+         if: github.event.inputs.action == 'apply'
+-        run: terraform -chdir=infrastructure apply -input=false -auto-approve -var="db_password=${{ github.event.inputs.db_password }}"
++        working-directory: infrastructure
++        env:
++          TF_VAR_db_password: ${{ github.event.inputs.db_password != '' && github.event.inputs.db_password || secrets.DB_PASSWORD }}
++        run: terraform apply -input=false -auto-approve
+ 
+       - name: Terraform Destroy
+         if: github.event.inputs.action == 'destroy'
+-        run: terraform -chdir=infrastructure destroy -input=false -auto-approve
++        working-directory: infrastructure
++        env:
++          TF_VAR_db_password: ${{ github.event.inputs.db_password != '' && github.event.inputs.db_password || secrets.DB_PASSWORD }}
++        run: terraform destroy -input=false -auto-approve
++
++      - name: Outputs
++        if: github.event.inputs.action == 'apply'
++        working-directory: infrastructure
++        run: |
++          echo "=== Terraform Outputs ==="
++          terraform output
++          ALB_DNS=$(terraform output -raw alb_dns 2>/dev/null || echo "unavailable")
++          echo "App URL: http://${ALB_DNS}" >> "$GITHUB_STEP_SUMMARY"
++          echo "::notice::App URL http://${ALB_DNS} - re-run the CI workflow to pin the services to the latest images"
+diff --git a/.gitignore b/.gitignore
+index 5b68aa8..b40b893 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,23 +1,12 @@
+-# Terraform
+-infrastructure/*.tfstate
+-infrastructure/*.tfstate.backup
+-infrastructure/.terraform/
+-infrastructure/*.tfplan
+-infrastructure/terraform.tfvars
+-
+-# Environment variables
+ .env
+ .env.*
+-
+-# Node.js
++*.pem
++*.key
+ node_modules/
+-
+-# Java
+ backend/target/
+-
+-# React
+ frontend/build/
+-
+-# Certificates
+-*.pem
+-*.key
+\ No newline at end of file
++infrastructure/terraform.tfstate*
++infrastructure/.terraform/
++infrastructure/*.tfplan
++infrastructure/terraform.tfvars
++.DS_Store
+diff --git a/.gitlab-ci.yml b/.gitlab-ci.yml
+deleted file mode 100644
+index 2bcafde..0000000
+--- a/.gitlab-ci.yml
++++ /dev/null
+@@ -1,135 +0,0 @@
+-stages:
+-  - validate
+-  - build
+-  - deploy
+-  - destroy
+-
+-variables:
+-  AWS_DEFAULT_REGION: us-east-1
+-  ECR_REGISTRY: "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+-  BACKEND_REPO: ecommerce-backend
+-  FRONTEND_REPO: ecommerce-frontend
+-  BACKEND_IMAGE: "${ECR_REGISTRY}/${BACKEND_REPO}:${CI_COMMIT_SHA}"
+-  FRONTEND_IMAGE: "${ECR_REGISTRY}/${FRONTEND_REPO}:${CI_COMMIT_SHA}"
+-  ECS_CLUSTER: ecommerce-cluster
+-  ECS_SERVICE_BACKEND: backend-service
+-  ECS_SERVICE_FRONTEND: frontend-service
+-  DOCKER_HOST: tcp://docker:2376
+-  DOCKER_TLS_CERTDIR: "/certs"
+-  DOCKER_TLS_VERIFY: "1"
+-  DOCKER_CERT_PATH: "/certs/client"
+-
+-validate:
+-  stage: validate
+-  image: alpine:3.20
+-  script:
+-    - |
+-      if [ -z "$AWS_ACCESS_KEY_ID" ]; then echo "MISSING: AWS_ACCESS_KEY_ID"; exit 1; fi
+-      if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then echo "MISSING: AWS_SECRET_ACCESS_KEY"; exit 1; fi
+-      if [ -z "$AWS_DEFAULT_REGION" ]; then echo "MISSING: AWS_DEFAULT_REGION"; exit 1; fi
+-      if [ -z "$AWS_ACCOUNT_ID" ]; then echo "MISSING: AWS_ACCOUNT_ID"; exit 1; fi
+-      if [ -z "$ALB_DNS" ]; then echo "MISSING: ALB_DNS"; exit 1; fi
+-      echo "All required CI variables present."
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-.dind:
+-  image: docker:24.0.5
+-  services:
+-    - name: docker:24.0.5-dind
+-      command: ["--tls=false"]
+-
+-build-backend:
+-  extends: .dind
+-  stage: build
+-  before_script:
+-    - apk add --no-cache aws-cli
+-    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+-  script:
+-    - docker build -t "$BACKEND_IMAGE" -t "${ECR_REGISTRY}/${BACKEND_REPO}:latest" backend/
+-    - docker push "$BACKEND_IMAGE"
+-    - docker push "${ECR_REGISTRY}/${BACKEND_REPO}:latest"
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-build-frontend:
+-  extends: .dind
+-  stage: build
+-  before_script:
+-    - apk add --no-cache aws-cli
+-    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+-  script:
+-    - docker build -t "$FRONTEND_IMAGE" -t "${ECR_REGISTRY}/${FRONTEND_REPO}:latest" frontend/
+-    - docker push "$FRONTEND_IMAGE"
+-    - docker push "${ECR_REGISTRY}/${FRONTEND_REPO}:latest"
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-.ecs-deploy:
+-  stage: deploy
+-  image:
+-    name: amazon/aws-cli:latest
+-    entrypoint: [""]
+-  before_script:
+-    - command -v jq >/dev/null 2>&1 || yum install -y jq >/dev/null 2>&1
+-  script:
+-    - |
+-      if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
+-      if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
+-      echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
+-      TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+-      if [ -z "$TASK_DEF_ARN" ]; then echo "ERROR: empty task def ARN"; exit 1; fi
+-      if [ "$TASK_DEF_ARN" = "None" ]; then echo "ERROR: service $ECS_SERVICE not found — run terraform apply first"; exit 1; fi
+-      echo "Current task def: $TASK_DEF_ARN"
+-      aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
+-      jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
+-      NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+-      echo "New task def: $NEW_ARN"
+-      aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
+-      echo "Rollout triggered for $ECS_SERVICE"
+-
+-deploy-backend:
+-  extends: .ecs-deploy
+-  variables:
+-    ECS_SERVICE: backend-service
+-    IMAGE: "${ECR_REGISTRY}/${BACKEND_REPO}:${CI_COMMIT_SHA}"
+-  needs:
+-    - build-backend
+-  environment:
+-    name: production
+-    url: "http://${ALB_DNS}"
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-deploy-frontend:
+-  extends: .ecs-deploy
+-  variables:
+-    ECS_SERVICE: frontend-service
+-    IMAGE: "${ECR_REGISTRY}/${FRONTEND_REPO}:${CI_COMMIT_SHA}"
+-  needs:
+-    - build-frontend
+-  environment:
+-    name: production
+-    url: "http://${ALB_DNS}"
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-destroy:
+-  stage: destroy
+-  image:
+-    name: hashicorp/terraform:latest
+-    entrypoint: [""]
+-  variables:
+-    TF_VAR_db_password: "${DB_PASSWORD}"
+-    TF_VAR_backend_image: "${ECR_REGISTRY}/${BACKEND_REPO}:latest"
+-    TF_VAR_frontend_image: "${ECR_REGISTRY}/${FRONTEND_REPO}:latest"
+-  before_script:
+-    - cd infrastructure
+-    - terraform init -input=false
+-  script:
+-    - echo "DESTROYING ALL TERRAFORM-MANAGED INFRASTRUCTURE"
+-    - terraform destroy -input=false -auto-approve
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-      when: manual
+-      allow_failure: false
+\ No newline at end of file
+diff --git a/.gitlab-ci.yml.bak b/.gitlab-ci.yml.bak
+deleted file mode 100644
+index 2bcafde..0000000
+--- a/.gitlab-ci.yml.bak
++++ /dev/null
+@@ -1,135 +0,0 @@
+-stages:
+-  - validate
+-  - build
+-  - deploy
+-  - destroy
+-
+-variables:
+-  AWS_DEFAULT_REGION: us-east-1
+-  ECR_REGISTRY: "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+-  BACKEND_REPO: ecommerce-backend
+-  FRONTEND_REPO: ecommerce-frontend
+-  BACKEND_IMAGE: "${ECR_REGISTRY}/${BACKEND_REPO}:${CI_COMMIT_SHA}"
+-  FRONTEND_IMAGE: "${ECR_REGISTRY}/${FRONTEND_REPO}:${CI_COMMIT_SHA}"
+-  ECS_CLUSTER: ecommerce-cluster
+-  ECS_SERVICE_BACKEND: backend-service
+-  ECS_SERVICE_FRONTEND: frontend-service
+-  DOCKER_HOST: tcp://docker:2376
+-  DOCKER_TLS_CERTDIR: "/certs"
+-  DOCKER_TLS_VERIFY: "1"
+-  DOCKER_CERT_PATH: "/certs/client"
+-
+-validate:
+-  stage: validate
+-  image: alpine:3.20
+-  script:
+-    - |
+-      if [ -z "$AWS_ACCESS_KEY_ID" ]; then echo "MISSING: AWS_ACCESS_KEY_ID"; exit 1; fi
+-      if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then echo "MISSING: AWS_SECRET_ACCESS_KEY"; exit 1; fi
+-      if [ -z "$AWS_DEFAULT_REGION" ]; then echo "MISSING: AWS_DEFAULT_REGION"; exit 1; fi
+-      if [ -z "$AWS_ACCOUNT_ID" ]; then echo "MISSING: AWS_ACCOUNT_ID"; exit 1; fi
+-      if [ -z "$ALB_DNS" ]; then echo "MISSING: ALB_DNS"; exit 1; fi
+-      echo "All required CI variables present."
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-.dind:
+-  image: docker:24.0.5
+-  services:
+-    - name: docker:24.0.5-dind
+-      command: ["--tls=false"]
+-
+-build-backend:
+-  extends: .dind
+-  stage: build
+-  before_script:
+-    - apk add --no-cache aws-cli
+-    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+-  script:
+-    - docker build -t "$BACKEND_IMAGE" -t "${ECR_REGISTRY}/${BACKEND_REPO}:latest" backend/
+-    - docker push "$BACKEND_IMAGE"
+-    - docker push "${ECR_REGISTRY}/${BACKEND_REPO}:latest"
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-build-frontend:
+-  extends: .dind
+-  stage: build
+-  before_script:
+-    - apk add --no-cache aws-cli
+-    - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+-  script:
+-    - docker build -t "$FRONTEND_IMAGE" -t "${ECR_REGISTRY}/${FRONTEND_REPO}:latest" frontend/
+-    - docker push "$FRONTEND_IMAGE"
+-    - docker push "${ECR_REGISTRY}/${FRONTEND_REPO}:latest"
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-.ecs-deploy:
+-  stage: deploy
+-  image:
+-    name: amazon/aws-cli:latest
+-    entrypoint: [""]
+-  before_script:
+-    - command -v jq >/dev/null 2>&1 || yum install -y jq >/dev/null 2>&1
+-  script:
+-    - |
+-      if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
+-      if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
+-      echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
+-      TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
+-      if [ -z "$TASK_DEF_ARN" ]; then echo "ERROR: empty task def ARN"; exit 1; fi
+-      if [ "$TASK_DEF_ARN" = "None" ]; then echo "ERROR: service $ECS_SERVICE not found — run terraform apply first"; exit 1; fi
+-      echo "Current task def: $TASK_DEF_ARN"
+-      aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
+-      jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
+-      NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+-      echo "New task def: $NEW_ARN"
+-      aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
+-      echo "Rollout triggered for $ECS_SERVICE"
+-
+-deploy-backend:
+-  extends: .ecs-deploy
+-  variables:
+-    ECS_SERVICE: backend-service
+-    IMAGE: "${ECR_REGISTRY}/${BACKEND_REPO}:${CI_COMMIT_SHA}"
+-  needs:
+-    - build-backend
+-  environment:
+-    name: production
+-    url: "http://${ALB_DNS}"
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-deploy-frontend:
+-  extends: .ecs-deploy
+-  variables:
+-    ECS_SERVICE: frontend-service
+-    IMAGE: "${ECR_REGISTRY}/${FRONTEND_REPO}:${CI_COMMIT_SHA}"
+-  needs:
+-    - build-frontend
+-  environment:
+-    name: production
+-    url: "http://${ALB_DNS}"
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-
+-destroy:
+-  stage: destroy
+-  image:
+-    name: hashicorp/terraform:latest
+-    entrypoint: [""]
+-  variables:
+-    TF_VAR_db_password: "${DB_PASSWORD}"
+-    TF_VAR_backend_image: "${ECR_REGISTRY}/${BACKEND_REPO}:latest"
+-    TF_VAR_frontend_image: "${ECR_REGISTRY}/${FRONTEND_REPO}:latest"
+-  before_script:
+-    - cd infrastructure
+-    - terraform init -input=false
+-  script:
+-    - echo "DESTROYING ALL TERRAFORM-MANAGED INFRASTRUCTURE"
+-    - terraform destroy -input=false -auto-approve
+-  rules:
+-    - if: '$CI_COMMIT_BRANCH == "main"'
+-      when: manual
+-      allow_failure: false
+\ No newline at end of file
+diff --git a/README.md b/README.md
+index 87e43c9..53ec8e5 100644
+--- a/README.md
++++ b/README.md
+@@ -1,171 +1,405 @@
+-# E-Commerce Application 
++# E-Commerce on AWS ECS (EC2 launch type)
+ 
+-A full-stack e-commerce application with a Java backend and React frontend, deployed on AWS ECS with an Application Load Balancer.
++A small e-commerce app — Java 17 / Spring Boot 3.3 API and a React 18 frontend — packaged as two
++Docker images, stored in ECR, and run as ECS services on EC2 worker instances behind an
++Application Load Balancer, with Postgres on RDS. Everything on AWS is described in Terraform, and
++GitHub Actions is the only deploy path: push to `main` → images are built and pushed → both ECS
++services are rolled onto the new image tags. Terraform is applied or destroyed from the Actions UI
++against one shared S3 state file.
+ 
+-## Architecture Diagram
++## Architecture
+ 
+-```mermaid
+-graph TD
+-    A[Client Browser] --> B[ALB]
+-    B --> C[Backend Service]
+-    B --> D[Frontend Service]
+-    C --> E[(PostgreSQL RDS)]
+-    subgraph AWS VPC
+-        B
+-        C
+-        D
+-        E
+-    end
+ ```
++                        ┌─────────────── public subnet ×2 ───────────────┐
++  browser ──HTTP:80──►  │            ALB  ecommerce-alb                  │
++                        │   /            → ecommerce-frontend-tg :80     │
++                        │   /api/*       → ecommerce-backend-tg  :8080   │
++                        └───────────┬────────────────────────────────────┘
++                                    │  (target group health checks)
++      ┌───────────────── private subnet ×2 ─────────────────┐
++      │  EC2 t3.micro worker (ASG min/desired 1, max 2)     │
++      │    ├─ frontend container   :80   (nginx, host net)  │
++      │    └─ backend  container   :8080 (Spring Boot)      │
++      │  RDS Postgres 15  db.t3.micro   :5432               │
++      └─────────────────────────────────────────────────────┘
++      images pulled from ECR (ecommerce-backend, ecommerce-frontend)
++      stdout → CloudWatch Logs /ecs/backend, /ecs/frontend
++```
++
++`network_mode = "host"`: containers use the instance's ports directly, so `80`/`8080` are the
++only ports the ALB security group needs to reach. The two ECS services are allowed to stop the old
++task before starting the new one (`deployment_minimum_healthy_percent = 0`) because a second task
++on the same instance could never bind the same host port.
++
++## Tech stack
+ 
+-## Tech Stack
++| Layer | Choice |
++|---|---|
++| Backend | Java 17, Spring Boot 3.3.0, Spring Web / Security / Data JPA / Validation / Actuator, JJWT |
++| Frontend | React 18, Create React App (`react-scripts` 5), `axios`, `react-router-dom` |
++| Database | Amazon RDS for PostgreSQL 15 (`db.t3.micro`, 20 GB) |
++| Infra | Terraform ≥ 1.5, AWS provider `~> 5.0`, S3 + DynamoDB state backend |
++| Compute | ECS (EC2 launch type) on an ECS-optimized AL2023 AMI via Auto Scaling |
++| Traffic | Application Load Balancer, HTTP only (no ACM cert in this scope) |
++| CI/CD | GitHub Actions: `ci.yml` (build → ECR → deploy), `terraform.yml` (plan/apply/destroy) |
+ 
+-- **Backend**: Java (Spring Boot)
+-- **Frontend**: React (Create React App)
+-- **Infrastructure**: AWS (ECS, ECR, ALB, RDS, VPC)
+-- **Containerization**: Docker
+-- **Orchestration**: Terraform
+-- **CI/CD**: GitHub Actions
++## Repo layout
++
++```
++.github/workflows/ci.yml            build + push + ECS rollout
++.github/workflows/terraform.yml     manual plan / apply / destroy
++backend/                            Spring Boot API (see Deliverable 1)
++frontend/                           React app served by nginx (see Deliverable 2)
++infrastructure/                     Terraform: vpc, ecr, alb, ecs, rds, backend.tf
++scripts/ecs-deploy.sh               the deploy step used by both CI jobs
++```
++
++## AWS account context
++
++Assumed while writing this repo: account `414100287492`, region `us-east-1`, EC2 vCPU quota of
++**2** (one `t3.micro` at a time), and a $200 promotional credit. The quota is why the ASG is
++`desired = 1`, and why `max = 2` is only useful after a quota increase.
+ 
+ ## Prerequisites
+ 
+-- AWS Account with appropriate permissions
+-- Terraform >= 1.0.0
+-- Docker
+-- Git
+-- AWS CLI (for local testing)
++- AWS account with permissions for VPC/EC2/ECS/ELBv2/RDS/ECR/IAM/CloudWatch Logs/S3/DynamoDB
++- Terraform >= 1.5, Docker, Git, AWS CLI v2 (`aws --version`)
++- A GitHub repository with Actions enabled
+ 
+-## Setup Instructions
++## Setup
+ 
+-### 1. Clone the Repository
++### 1. Clone the repository
+ 
+ ```bash
+ git clone <repository-url>
+ cd ecommerce
+ ```
+ 
+-### 2. Set Up AWS Credentials
++### 2. Terraform state bucket (one time)
+ 
+-Configure your AWS credentials using one of the following methods:
+-- AWS CLI: `aws configure`
+-- Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
+-- IAM roles (if running on EC2)
++`infrastructure/backend.tf` already points at `ecommerce-tfstate-414100287492`, so the bucket and
++its lock table must exist before the first `terraform init` — locally *and* in Actions:
+ 
+-### 3. Create S3 Backend for Terraform State
++```bash
++export AWS_DEFAULT_REGION=us-east-1
++
++# us-east-1 rejects a LocationConstraint, so only --region is passed
++aws s3api create-bucket --bucket ecommerce-tfstate-414100287492 --region us-east-1
++aws s3api put-bucket-versioning --bucket ecommerce-tfstate-414100287492 \
++  --versioning-configuration Status=Enabled
++aws s3api put-bucket-encryption --bucket ecommerce-tfstate-414100287492 \
++  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
++aws s3api put-public-access-block --bucket ecommerce-tfstate-414100287492 \
++  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
++
++aws dynamodb create-table --table-name ecommerce-tfstate-lock \
++  --attribute-definitions AttributeName=LockID,AttributeType=S \
++  --key-schema AttributeName=LockID,KeyType=HASH \
++  --billing-mode PAY_PER_REQUEST --region us-east-1
++
++aws dynamodb describe-table --table-name ecommerce-tfstate-lock --query 'Table.TableStatus' --output text   # ACTIVEaws dynamodb describe-table --table-name ecommerce-tfstate-lock --query 'Table.TableStatus' --output text   # ACTIVE
++```
+ 
+-For production use, configure Terraform to use an S3 bucket for state storage. See [Terraform S3 Backend Documentation](https://developer.hashicorp.com/terraform/language/settings/backends/s3).
+ 
+-Example `backend.hcl`:
+-```hcl
+-bucket = "your-terraform-state-bucket"
+-key    = "ecommerce/terraform.tfstate"
+-region = "us-east-1"
++Attach this to the identity that runs Terraform (and to the CI access key) if it is not an admin:
++
++```json
++{
++  "Version": "2012-10-17",
++  "Statement": [
++    {
++      "Sid": "TerraformState",
++      "Effect": "Allow",
++      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
++      "Resource": [
++        "arn:aws:s3:::ecommerce-tfstate-414100287492",
++        "arn:aws:s3:::ecommerce-tfstate-414100287492/*"
++      ]
++    },
++    {
++      "Sid": "TerraformStateLock",
++      "Effect": "Allow",
++      "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem"],
++      "Resource": "arn:aws:dynamodb:us-east-1:414100287492:table/ecommerce-tfstate-lock"
++    }
++  ]
++}
+ ```
+ 
+-Then initialize Terraform with:
++An **empty bucket is normal before the first apply** - it is only a problem if the bucket has no
++`prod/terraform.tfstate` *while the account already has the resources*. That mismatch is what
++happens when an earlier run had no backend: `terraform init` on a GitHub runner with no
++`backend.tf` keeps its state on the ephemeral machine, so every apply created real resources
++and threw the state away. `infrastructure/cleanup.sh` (and the hardcoded VPC ids inside it)
++exists in this repo's history for exactly that reason.
++
++Before applying anything, check what the state thinks versus what exists:
++
+ ```bash
+-terraform -chdir=infrastructure init -backend-config=backend.hcl
++aws ec2 describe-vpcs --filters Name=tag:Project,Values=ecommerce \
++  --query 'VPCs[].[VpcId,CidrBlock,Tags[?Key==`Name`].Value|[0]]' --output text
++aws ecs describe-clusters --clusters ecommerce-cluster --query 'clusters[0].status' --output text
++aws autoscaling describe-auto-scaling-groups \
++  --query 'AutoScalingGroups[].[AutoScalingGroupName,MinSize,DesiredCapacity,MaxSize]' --output text
+ ```
+ 
+-### 4. Initialize and Apply Terraform
++If resources exist and the state is empty, do **not** run `terraform apply`: it would build a
++second VPC, NAT gateway (~$33/month each) and RDS instance next to the first. Either recover the
++previous `terraform.tfstate` and `terraform init -migrate-state`, or delete the leftovers first.
++For the worker/capacity half of the problem there is also a state-free repair:
++`sh scripts/ecs-worker-repair.sh` (below).
++
++### 3. ECR repositories
++
++Nothing to do: `infrastructure/ecr.tf` creates `ecommerce-backend` and `ecommerce-frontend` with a
++"keep last 10 images" lifecycle policy. Do **not** also run `aws ecr create-repository` — Terraform
++would fail with `RepositoryAlreadyExistsException`. (Only if you deliberately keep ECR out of
++Terraform: `aws ecr create-repository --repository-name ecommerce-backend` and
++`--repository-name ecommerce-frontend`.)
++
++### 4. IAM user for CI
++
++Create an access key for a user that can push to ECR and roll ECS services. For a throwaway
++learning account, `AdministratorAccess` is the fast path; the scoped set is
++`EC2ContainerRegistryPowerUser` plus `ecs:DescribeServices`, `ecs:DescribeTaskDefinition`,
++`ecs:RegisterTaskDefinition`, `ecs:UpdateService`, `ecs:DescribeClusters` — and the state policy
++from step 2.
++
++### 5. Configure GitHub
++
++Settings → **Secrets and variables → Actions**:
++
++| Secrets | |
++|---|---|
++| `AWS_ACCESS_KEY_ID` | from step 4 |
++| `AWS_SECRET_ACCESS_KEY` | from step 4 |
++| `DB_PASSWORD` | the RDS password; the Terraform workflow falls back to this secret |
++
++| Repository variables | |
++|---|---|
++| `AWS_DEFAULT_REGION` | `us-east-1` |
++| `AWS_ACCOUNT_ID` | `414100287492` |
++| `ALB_DNS` | fill in after step 6 (frontend container URL for external use; the ALB already routes `/api`) |
++
++### 6. Apply the infrastructure
++
++From your laptop:
+ 
+ ```bash
+ cd infrastructure
+-terraform init
+-terraform apply -var="db_password=YourSecurePassword123!"
++echo 'db_password = "MyApp2025!SecurePass"' > terraform.tfvars   # gitignored, >= 8 chars
++terraform init            # attaches the S3 backend from step 2
++terraform plan
++terraform apply
++terraform output -raw alb_dns    # → put it in the ALB_DNS variable
++```
++
++Or from GitHub: **Actions → Terraform → Run workflow → `action: apply`** (leave `db_password`
++empty if the `DB_PASSWORD` secret is set; `action: destroy` additionally requires typing
++`DESTROY`). Runs are serialised through `concurrency` + the DynamoDB lock, and take ~8-10 min
++because the NAT gateway and RDS are slow.
++
++### 7. Push to main
++
++```bash
++git push origin main
++```
++
++CI builds both images, pushes `:<git-sha>` and `:latest` to ECR, and rolls `backend-service` and
++`frontend-service`. Watch it in **Actions → CI**; a failed deploy prints the AWS error as an
++annotation on the job (no need to open the raw log).
++
++### 8. Smoke test
++
++```bash
++ALB=$(cd infrastructure && terraform output -raw alb_dns)
++curl -i http://$ALB/                     # 200 - React shell
++curl -i http://$ALB/api/products          # 200 - [] on a fresh stack
++curl -s -XPOST http://$ALB/api/auth/signup -H 'content-type: application/json' \
++  -d '{"email":"seller@example.com","password":"supersecret1","role":"SELLER"}'
++TOKEN=$(curl -s -XPOST http://$ALB/api/auth/signin -H 'content-type: application/json' \
++  -d '{"email":"seller@example.com","password":"supersecret1"}' | sed 's/.*"token":"\([^"]*\)".*/\1/')
++curl -s -XPOST http://$ALB/api/products -H "authorization: Bearer $TOKEN" \
++  -H 'content-type: application/json' -d '{"name":"Headphones","price":49.99}'
++curl -s http://$ALB/api/products         # → the product is listed
+ ```
+ 
+-### 5. Configure GitHub Secrets
++### 9. If the services never reach `running`
+ 
+-Set up the following secrets in your GitHub repository (Settings > Secrets > Actions):
++The worker instance needs ~3-4 minutes after `apply` before the ECS agent registers. Then:
+ 
+-| Secret Name | Description |
+-|-------------|-------------|
+-| `AWS_ACCESS_KEY_ID` | AWS access key ID (if not using OIDC) |
+-| `AWS_SECRET_ACCESS_KEY` | AWS secret access key (if not using OIDC) |
+-| `AWS_DEFAULT_REGION` | AWS region (e.g., us-east-1) |
+-| `AWS_ACCOUNT_ID` | AWS account ID (e.g., 414100287492) |
+-| `ALB_DNS` | The DNS name of the Application Load Balancer (output from Terraform) |
+-| `DB_PASSWORD` | Database password for RDS (if using workflow_dispatch for Terraform apply) |
++```bash
++sleep 240
++aws ecs list-container-instances --cluster ecommerce-cluster
++aws ecs update-service --cluster ecommerce-cluster --service backend-service  --force-new-deployment
++aws ecs update-service --cluster ecommerce-cluster --service frontend-service --force-new-deployment
++```
+ 
+-> **Note**: If you prefer to use OIDC for authentication, set up an IAM role that trusts GitHub's OIDC provider and grant it the necessary permissions. Then, in the workflows, use `aws-actions/configure-aws-credentials@v4` with `role-to-assume` instead of access key secrets.
++## API surface
+ 
+-## Deployment Flow
++| Method | Path | Auth | Notes |
++|---|---|---|---|
++| `POST` | `/api/auth/signup` | public | `{email, password, role?}` → `201 {id, email, role}`; role defaults to `BUYER` |
++| `POST` | `/api/auth/signin` | public | `{email, password}` → `{token, tokenType, id, email, role}` |
++| `GET` | `/api/products` | public | catalogue for the buyer page |
++| `POST` | `/api/products` | `SELLER` | `{name, price}`; `sellerId` is taken from the JWT, never the body |
++| `PUT` | `/api/products/{id}` | `SELLER` | updates `price` (and `name` if sent); only the owning seller |
++| `POST` | `/api/auth/otp/*`, `/api/auth/google` | public | **stubs** returning `501` — see the `TODO(auth)` comments |
+ 
+-1. Developer pushes code to `main` branch or opens a pull request targeting `main`.
+-2. GitHub Actions workflow (`ci.yml`) is triggered:
+-   - `validate`: Checks for required AWS secrets/variables.
+-   - `build-and-push-backend`: Builds and pushes the backend Docker image to ECR.
+-   - `build-and-push-frontend`: Builds and pushes the frontend Docker image to ECR.
+-   - `deploy-backend` (only on main branch push): 
+-     - Retrieves the current task definition for the backend service.
+-     - Replaces the image with the newly built image.
+-     - Registers a new task definition.
+-     - Updates the service to use the new task definition (triggering a rolling update).
+-   - `deploy-frontend` (only on main branch push): Same as above for the frontend service.
+-3. AWS ECS rolls out the new task definitions, and the ALB routes traffic to the updated containers.
++Datasource settings come from `SPRING_DATASOURCE_URL` / `_USERNAME` / `_PASSWORD`, which
++`infrastructure/ecs.tf` injects into the task definition.
+ 
+-## Accessing the Site
++## Deployment flow
+ 
+-After deployment, the application can be accessed at the ALB's DNS name (output as `alb_dns` from Terraform). The frontend is served on port 80, and the backend API is available under the `/api/*` path.
++1. `validate` — checks the secrets/variables exist, fails early with a named list.
++2. `build-and-push-backend` / `build-and-push-frontend` — ECR login, `docker/build-push-action@v5`,
++   tags `:<github.sha>` **and** `:latest`.
++3. `deploy-backend` / `deploy-frontend` (main pushes and manual runs) — `scripts/ecs-deploy.sh`:
++   checks the cluster is `ACTIVE`, reads the service's current task definition, swaps the container
++   image, registers a new revision from **only the arguments `RegisterTaskDefinition` accepts**, and
++   calls `update-service --force-new-deployment`. Set `WAIT_FOR_STABLE: 1` on a job to also wait for
++   steady state.
+ 
+-## Destroying Infrastructure
++## Cost estimate
+ 
+-To destroy all Terraform-managed infrastructure:
++| Item | ~Monthly |
++|---|---|
++| NAT Gateway (365-day-visible cost driver) | $32.85 |
++| ALB | $16.43 |
++| EC2 `t3.micro` worker | $7.60 after the 750 h free tier |
++| RDS `db.t3.micro` + 20 GB | $14.71 |
++| ECR + CloudWatch Logs | ~$1.00 |
++| S3 state bucket + DynamoDB lock | ~$0.10 |
++| **Total** | **~$74** |
+ 
+-1. Go to the Actions tab in your GitHub repository.
+-2. Select the "Terraform" workflow.
+-3. Click "Run workflow".
+-4. Set the `action` input to `destroy`.
+-5. **Important**: You must type `DESTROY` in the `confirmation` input field to confirm the destruction.
+-6. Click "Run workflow".
++On a $200 credit that is roughly **2.5 months** — so destroy the stack when you are done (below).
++Drop the NAT gateway + private subnets (put the workers in public subnets) to save ~$33/month.
+ 
+-## Cost Estimate
++## How to destroy
+ 
+-This architecture is designed to be cost-effective for development and testing:
++**Actions → Terraform → Run workflow → `action: destroy`**, and type `DESTROY` in `confirmation`.
++The workflow refuses without it. Local equivalent:
+ 
+-- **EC2 t3.micro** (ECS instances): Eligible for AWS Free Tier (750 hours/month)
+-- **Application Load Balancer**: Eligible for AWS Free Tier (750 hours/month)
+-- **RDS PostgreSQL db.t3.micro**: Eligible for AWS Free Tier (750 hours/month)
+-- **ECR Storage**: First 500 MB/month free
+-- **Data Transfer**: First 1 GB/month free
++```bash
++cd infrastructure && terraform destroy -var-file=terraform.tfvars
++```
+ 
+-Beyond the Free Tier, estimated monthly cost is approximately **$20-$50** for light usage. AWS provides $200 in credits for new accounts that can cover several months of usage.
++Destroying removes the cluster too, so the next CI deploy fails with
++`cluster 'ecommerce-cluster' was not found / has status INACTIVE` until you apply again — the
++`ecs-deploy.sh` preflight prints exactly that.
+ 
+ ## Troubleshooting
+ 
+-### Common Errors
+-
+-#### 502 Bad Gateway
+-- **Cause**: The ALB cannot connect to the target (ECS service).
+-- **Checks**:
+-  - Ensure the security group for ECS instances allows inbound traffic from the ALB security group on ports 80 and 8080.
+-  - Verify that the ECS service is running and healthy.
+-  - Check the container ports in the task definition match those in the ALB target group.
+-
+-#### 503 Service Unavailable
+-- **Cause**: No healthy targets in the target group.
+-- **Checks**:
+-  - Verify that the ECS service has at least one running task.
+-  - Check the health check configuration in the target group (should match the container port).
+-  - Look at the task logs for application startup errors.
+-
+-#### Timeout Errors
+-- **Cause**: Application takes too long to respond or health checks fail.
+-- **Checks**:
+-  - Increase the health check timeout interval in the target group if needed.
+-  - Check application logs for startup delays or errors.
+-  - Ensure the container has sufficient CPU/memory allocated.
+-
+-#### No Targets Registered
+-- **Cause**: ECS service is not registering targets with the ALB.
+-- **Checks**:
+-  - Verify that the `target_group_arns` are correctly set in the Auto Scaling Group (see `ecs.tf`).
+-  - Ensure the ECS container instances are in the same VPC subnets as the ALB.
+-  - Check the security group rules between the container instances and the ALB.
+-
+-#### Deployment Fails to Update Service
+-- **Cause**: IAM permissions or task definition issues.
+-- **Checks**:
+-  - Ensure the IAM role used by GitHub Actions has `ecs:DescribeServices`, `ecs:DescribeTaskDefinition`, `ecs:RegisterTaskDefinition`, and `ecs:UpdateService` permissions.
+-  - Validate the task definition JSON is correctly formatted after image replacement.
++| Symptom | Cause | Fix |
++|---|---|---|
++| Deploy "succeeds" but `runningCount` is 0 | no capacity / image pull / port not answering | `sh scripts/ecs-diagnose.sh` (read-only) - see below |
++| `list-container-instances` is empty, ASG activity says `InvalidAMIID.NotFound` | the worker launch template points at a retired AMI, or the ASG is scaled to 0 | `sh scripts/ecs-worker-repair.sh` then the same with `--yes` |
++| `502 Bad Gateway` from the ALB | task not running, or the SG does not allow the ALB → instance on 80/8080 | `aws ecs describe-services --cluster ecommerce-cluster --services backend-service`; check `aws ecs describe-tasks` `stoppedReason` |
++| `503 Service Unavailable` | target registered but unhealthy | health-check path/`matcher` in `alb.tf`; backend answers 404 on `/actuator/health` (context path `/api`) which is accepted |
++| Timeouts on first requests | Spring Boot cold start + RDS connection | raise `unhealthy_threshold`/`interval` on the backend target group, or warm up before testing |
++| No targets registered at all | ECS agent never joined the cluster | wait 3-4 min after apply, then `aws ecs list-container-instances`; check the instance's `/var/log/ecs/ecs-agent.log` (SSM Session Manager → `mysql`-free AL2023 host) |
++| Deploy fails: `Unknown parameter in input: "deregisteredAt"` | task definition JSON from `describe-task-definition` replayed verbatim | already handled — `scripts/ecs-deploy.sh` rebuilds the payload from the accepted arguments and logs what it drops |
++| Deploy fails: `The referenced cluster was inactive` | the stack was destroyed | `terraform apply` again (Actions → Terraform), then re-run CI |
++| Deploy fails: `Capacity providers ... no container instances` / task stuck in `PENDING` | ASG instance still booting, or the 2-vCPU quota already used by a second instance | `aws autoscaling describe-auto-scaling-groups`; check `STOPPED_REASON` of the failed task |
++| `terraform init` error about the S3 backend | bucket/lock table missing, or the key lacks the state policy | re-run setup step 2 |
++| `Error acquiring the state lock` | concurrent run, or a crashed run left a row | wait, or delete the row: `aws dynamodb delete-item --table-name ecommerce-tfstate-lock --key '{"LockID":{"S":"ecommerce-tfstate-414100287492/prod/terraform.tfstate"}}'` |
++| `CannotPullContainerImage` | ECR repos empty (never pushed) or wrong account in the image URI | push once via CI, or set `TF_VAR_backend_image`/`TF_VAR_frontend_image` |
++
++### Triage: "deploy succeeded" but 0 running tasks
++
++`update-service` returning without an error only means ECS accepted the new revision - the
++task still has to be placed on a registered instance and pass the target group health check.
++CI therefore sets `WAIT_FOR_STABLE: 1` on both deploy jobs (the job fails unless the service
++reaches steady state) and runs the triage script automatically afterwards. Reproduce it by hand:
++
++```bash
++sh scripts/ecs-diagnose.sh                      # both services
++sh scripts/ecs-diagnose.sh backend-service      # one of them
++```
++
++It reads (never writes) the cluster status, registered container instances and their remaining
++CPU/RAM, the worker ASG plus its **scaling activities** (where a vCPU-quota or AMI failure
++shows up), each service's `deployments[]`/events, stopped-task `stoppedReason`s, ALB target
++health and the last 15 minutes of container logs - then prints a verdict:
++
++| Verdict | Meaning | Next step it prints |
++|---|---|---|
++| `A`  | cluster missing or `INACTIVE` | `terraform apply`, then re-run CI |
++| `A1` | worker ASG has no instances | read scaling activities; `set-desired-capacity` |
++| `A2` | instance exists but never registered | SSM Session Manager → `tail /var/log/ecs/ecs-agent.log`, `cat /etc/ecs/ecs.config` |
++| `A3` | "unable to place a task ... insufficient CPU/memory" | compare task CPU/RAM with `remainingResources`; check `deploymentMinimumHealthyPercent` |
++| `B`  | `CannotPullContainerError` / access denied | task execution role policy, or the tag is gone from ECR (lifecycle keeps 10 images) |
++| `C`  | task running, target unhealthy | 60-120s cold start, then SG/path check (backend health is `/api/actuator/health`) |
++| `E`  | exit 137 / OOM | container memory is 256 MB in `ecs.tf` |
++
++For verdicts `A1`/`A2` - no registered worker - there is a repair path that does not need
++Terraform state at all. It is dry-run first, and it only ever touches the ASG whose launch
++template `user_data` joins your cluster:
++
++```bash
++sh scripts/ecs-worker-repair.sh          # prints the ASG, its AMI, the scaling activities, the plan
++sh scripts/ecs-worker-repair.sh --yes    # publishes a launch template version with a live
++                                         # AL2023 ECS AMI, asks for 1 instance, waits for registration
++```
++
++Read the plan before adding `--yes`. `ECS_REGISTER_TIMEOUT` (seconds, default 480) bounds the
++wait for the agent to come back, and it fails with the exact SSM / scaling-activity commands to
++run if the instance boots but never registers.
++
++To roll **both** services onto the same tag once capacity is back (the CI jobs do this in
++parallel; this is the sequential, single-command version - it runs the triage itself if a
++service fails to converge):
++
++```bash
++REGISTRY=414100287492.dkr.ecr.us-east-1.amazonaws.com TAG=$(git rev-parse HEAD) \
++  sh scripts/ecs-deploy-both.sh          # TAG=latest also works; both services, backend first
++```
++
++### Recycling a stuck worker safely
++
++If the instance must be replaced, go through the Auto Scaling group so a replacement is
++launched and the ASG stays consistent:
++
++```bash
++ASG=$(aws autoscaling describe-auto-scaling-groups \
++  --query "AutoScalingGroups[?starts_with(AutoScalingGroupName, 'ecs-worker-')].AutoScalingGroupName | [0]" \
++  --output text)
++aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++  --query 'AutoScalingGroups[0].Instances[].InstanceId' --output text
++aws autoscaling terminate-instance-in-auto-scaling-group \
++  --auto-scaling-group-name "$ASG" --instance-id <i-...>       # desired stays 1 -> replacement launches
++aws ecs wait container-instances-healthy --cluster ecommerce-cluster
++```
++
++Do **not** use `aws ec2 describe-instances --query 'Reservations[0].Instances[0].InstanceId'`
++to pick a victim: that is the first running instance in the whole account, not this stack's
++worker, and with `min_size = 1` a bare `ec2 terminate-instances` leaves the ASG to notice it
++later. The ASG-scoped call above is immediate and instance-level.
++
++### Running it locally
++
++```bash
++# API (needs a reachable Postgres, e.g. docker run -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=ecommerce -p 5432:5432 postgres:15)
++cd backend && mvn spring-boot:run        # http://localhost:8080/api/products
++
++# Frontend (proxies nothing: set the API origin explicitly)
++cd frontend && REACT_APP_API_URL=http://localhost:8080/api npm start
++```
++
++`frontend/Dockerfile` bakes `REACT_APP_API_URL` at build time (default empty → same-origin `/api`,
++which is what the ALB routing needs).
++
++### Images
++
++```bash
++docker build -t ecommerce-backend:dev backend/
++docker build -t ecommerce-frontend:dev frontend/
++```
++
++## Notes on what is intentionally not here
++
++- OTP and Google OAuth are stubs returning `501`; passwords are BCrypt, JWTs are HS256 with a
++  dev secret in `application.properties` (override `JWT_SECRET` in the task definition).
++- No HTTPS/ACM certificate, no WAF, no secrets manager: HTTP on port 80 is the whole listener.
++- `Order` has an entity and repository but no checkout controller — the "Buy" button says so.
++- No automated tests in CI; `mvn -DskipTests` in the Docker build keeps the image build fast.
+diff --git a/backend/Dockerfile b/backend/Dockerfile
+index 17a1a99..95547ba 100644
+--- a/backend/Dockerfile
++++ b/backend/Dockerfile
+@@ -1,13 +1,13 @@
+-# Build stage
++# --- Stage 1: build the fat jar ---------------------------------------------
+ FROM maven:3.9-eclipse-temurin-17 AS build
+ WORKDIR /app
+ COPY pom.xml .
+ COPY src ./src
+-RUN mvn clean package -DskipTests
++RUN mvn -B clean package -DskipTests
+ 
+-# Run stage
++# --- Stage 2: runtime --------------------------------------------------------
+ FROM eclipse-temurin:17-jre-jammy
+ WORKDIR /app
+ COPY --from=build /app/target/*.jar app.jar
+ EXPOSE 8080
+-ENTRYPOINT ["java", "-jar", "app.jar"]
+\ No newline at end of file
++ENTRYPOINT ["java", "-jar", "app.jar"]
+diff --git a/backend/pom.xml b/backend/pom.xml
+index 7c7fcdf..27e2712 100644
+--- a/backend/pom.xml
++++ b/backend/pom.xml
+@@ -1,17 +1,26 @@
+-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
++<project xmlns="http://maven.apache.org/POM/4.0.0"
++         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+     <modelVersion>4.0.0</modelVersion>
++
+     <parent>
+         <groupId>org.springframework.boot</groupId>
+         <artifactId>spring-boot-starter-parent</artifactId>
+         <version>3.3.0</version>
++        <relativePath/>
+     </parent>
++
+     <groupId>com.ecommerce</groupId>
+     <artifactId>ecommerce-app</artifactId>
+     <version>0.0.1-SNAPSHOT</version>
++    <name>ecommerce-app</name>
++    <description>Spring Boot backend for the ECS/EC2 e-commerce demo</description>
++
+     <properties>
+         <java.version>17</java.version>
++        <jjwt.version>0.11.5</jjwt.version>
+     </properties>
++
+     <dependencies>
+         <dependency>
+             <groupId>org.springframework.boot</groupId>
+@@ -27,31 +36,39 @@
+         </dependency>
+         <dependency>
+             <groupId>org.springframework.boot</groupId>
+-            <artifactId>spring-boot-starter-oauth2-client</artifactId>
++            <artifactId>spring-boot-starter-validation</artifactId>
+         </dependency>
++        <!-- The ALB backend target group health-checks this application. -->
++        <dependency>
++            <groupId>org.springframework.boot</groupId>
++            <artifactId>spring-boot-starter-actuator</artifactId>
++        </dependency>
++
+         <dependency>
+             <groupId>org.postgresql</groupId>
+             <artifactId>postgresql</artifactId>
+             <scope>runtime</scope>
+         </dependency>
++
+         <dependency>
+             <groupId>io.jsonwebtoken</groupId>
+             <artifactId>jjwt-api</artifactId>
+-            <version>0.11.5</version>
++            <version>${jjwt.version}</version>
+         </dependency>
+         <dependency>
+             <groupId>io.jsonwebtoken</groupId>
+             <artifactId>jjwt-impl</artifactId>
+-            <version>0.11.5</version>
++            <version>${jjwt.version}</version>
+             <scope>runtime</scope>
+         </dependency>
+         <dependency>
+             <groupId>io.jsonwebtoken</groupId>
+             <artifactId>jjwt-jackson</artifactId>
+-            <version>0.11.5</version>
++            <version>${jjwt.version}</version>
+             <scope>runtime</scope>
+         </dependency>
+     </dependencies>
++
+     <build>
+         <plugins>
+             <plugin>
+@@ -60,4 +77,4 @@
+             </plugin>
+         </plugins>
+     </build>
+-</project>
+\ No newline at end of file
++</project>
+diff --git a/backend/src/main/java/com/ecommerce/EcommerceApplication.java b/backend/src/main/java/com/ecommerce/EcommerceApplication.java
+index 2fd0b00..3f63e3c 100644
+--- a/backend/src/main/java/com/ecommerce/EcommerceApplication.java
++++ b/backend/src/main/java/com/ecommerce/EcommerceApplication.java
+@@ -1,10 +1,12 @@
+ package com.ecommerce;
++
+ import org.springframework.boot.SpringApplication;
+ import org.springframework.boot.autoconfigure.SpringBootApplication;
+ 
+ @SpringBootApplication
+ public class EcommerceApplication {
++
+     public static void main(String[] args) {
+         SpringApplication.run(EcommerceApplication.class, args);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/main/java/com/ecommerce/config/SecurityConfig.java b/backend/src/main/java/com/ecommerce/config/SecurityConfig.java
+index b4efe14..ac78bc4 100644
+--- a/backend/src/main/java/com/ecommerce/config/SecurityConfig.java
++++ b/backend/src/main/java/com/ecommerce/config/SecurityConfig.java
+@@ -1,26 +1,131 @@
+ package com.ecommerce.config;
+ 
++import io.jsonwebtoken.Claims;
++import io.jsonwebtoken.JwtException;
++import io.jsonwebtoken.Jwts;
++import io.jsonwebtoken.SignatureAlgorithm;
++import io.jsonwebtoken.security.Keys;
++import jakarta.servlet.FilterChain;
++import jakarta.servlet.ServletException;
++import jakarta.servlet.http.HttpServletRequest;
++import jakarta.servlet.http.HttpServletResponse;
++import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpMethod;
++import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+ import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+ import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
++import org.springframework.security.config.http.SessionCreationPolicy;
++import org.springframework.security.core.GrantedAuthority;
++import org.springframework.security.core.authority.SimpleGrantedAuthority;
++import org.springframework.security.core.context.SecurityContextHolder;
++import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
++import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.security.web.SecurityFilterChain;
++import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
++import org.springframework.web.filter.OncePerRequestFilter;
+ 
++import javax.crypto.SecretKey;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.time.Instant;
++import java.util.Date;
++import java.util.List;
++
++/**
++ * Stateless JWT security for the demo.
++ *
++ * <p>The token helpers live here (rather than in a separate {@code JwtService}) to keep the
++ * tree to the files listed in the project spec: this class is both the Spring Security
++ * configuration and the thing {@code AuthController} injects to mint tokens.
++ *
++ * <p>TODO(security): this is a deploy skeleton, not production auth. Before real use:
++ * rotate {@code app.jwt.secret} via SSM/Secrets Manager, add refresh tokens + revocation,
++ * and put rate limiting in front of /auth/*.
++ */
+ @Configuration
+ @EnableWebSecurity
+-@EnableMethodSecurity // Required for @PreAuthorize
++@EnableMethodSecurity // enables the @PreAuthorize("hasRole('SELLER')") checks in the controllers
+ public class SecurityConfig {
+ 
++    private final SecretKey signingKey;
++    private final long ttlMillis;
++
++    public SecurityConfig(@Value("${app.jwt.secret}") String secret,
++                          @Value("${app.jwt.ttl-minutes:720}") long ttlMinutes) {
++        // HS256 needs >= 256 bits of key material; fail loudly instead of at first sign-in.
++        this.signingKey = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
++        this.ttlMillis = ttlMinutes * 60_000L;
++    }
++
++    @Bean
++    public PasswordEncoder passwordEncoder() {
++        return new BCryptPasswordEncoder();
++    }
++
+     @Bean
+     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
++        // Paths are relative to server.servlet.context-path=/api, and the ALB forwards
++        // /api/* untouched, so /api/auth/signin shows up here as /auth/signin.
+         http
+             .csrf(csrf -> csrf.disable())
++            .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+             .authorizeHttpRequests(auth -> auth
+                 .requestMatchers("/auth/**").permitAll()
+-                .anyRequest().authenticated()
+-            )
+-            .oauth2Login(oauth2 -> {}); // Simplified OAuth2 setup
++                .requestMatchers("/actuator/health", "/actuator/health/**", "/actuator/info").permitAll()
++                .requestMatchers(HttpMethod.GET, "/products", "/products/*").permitAll()
++                .anyRequest().authenticated())
++            .addFilterBefore(new JwtAuthFilter(), UsernamePasswordAuthenticationFilter.class);
+         return http.build();
+     }
+-}
+\ No newline at end of file
++
++    public String generateToken(Long userId, String email, String role) {
++        Instant now = Instant.now();
++        return Jwts.builder()
++            .setSubject(email)
++            .claim("uid", userId)
++            .claim("role", role)
++            .setIssuedAt(Date.from(now))
++            .setExpiration(Date.from(now.plusMillis(ttlMillis)))
++            .signWith(signingKey, SignatureAlgorithm.HS256)
++            .compact();
++    }
++
++    public Claims parseToken(String token) throws JwtException {
++        return Jwts.parserBuilder()
++            .setSigningKey(signingKey)
++            .build()
++            .parseClaimsJws(token)
++            .getBody();
++    }
++
++    /** Reads {@code Authorization: Bearer <jwt>} and populates the SecurityContext. */
++    private class JwtAuthFilter extends OncePerRequestFilter {
++
++        @Override
++        protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
++                                        FilterChain chain) throws ServletException, IOException {
++            String header = request.getHeader(HttpHeaders.AUTHORIZATION);
++            if (header != null && header.startsWith("Bearer ")) {
++                try {
++                    Claims claims = parseToken(header.substring(7).trim());
++                    String email = claims.getSubject();
++                    String role = String.valueOf(claims.get("role"));
++                    List<GrantedAuthority> authorities =
++                        List.of(new SimpleGrantedAuthority("ROLE_" + role.toUpperCase()));
++                    UsernamePasswordAuthenticationToken authentication =
++                        new UsernamePasswordAuthenticationToken(email, claims.get("uid"), authorities);
++                    SecurityContextHolder.getContext().setAuthentication(authentication);
++                } catch (JwtException | IllegalArgumentException ex) {
++                    // Expired/tampered token: leave the context empty and let the
++                    // authorization rules answer with 401/403.
++                    SecurityContextHolder.clearContext();
++                }
++            }
++            chain.doFilter(request, response);
++        }
++    }
++}
+diff --git a/backend/src/main/java/com/ecommerce/controller/AuthController.java b/backend/src/main/java/com/ecommerce/controller/AuthController.java
+index 5432aeb..2cd36b1 100644
+--- a/backend/src/main/java/com/ecommerce/controller/AuthController.java
++++ b/backend/src/main/java/com/ecommerce/controller/AuthController.java
+@@ -1,18 +1,143 @@
+ package com.ecommerce.controller;
+-import org.springframework.web.bind.annotation.*;
+ 
++import com.ecommerce.config.SecurityConfig;
++import com.ecommerce.entity.User;
++import com.ecommerce.repository.UserRepository;
++import java.util.LinkedHashMap;
++import java.util.Locale;
++import java.util.Map;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.ResponseEntity;
++import org.springframework.security.crypto.password.PasswordEncoder;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
++
++/**
++ * Email + password signup / sign-in returning a JWT.
++ *
++ * <p>TODO(auth): OTP and Google sign-in are deliberately stubbed (see the 501 handlers at the
++ * bottom). This repo is a deployment skeleton; the goal is a working ECS service, not a
++ * production identity provider.
++ */
+ @RestController
+ @RequestMapping("/auth")
+ public class AuthController {
+ 
++    private static final int MIN_PASSWORD_LENGTH = 8;
++
++    private final UserRepository userRepository;
++    private final PasswordEncoder passwordEncoder;
++    private final SecurityConfig tokens;
++
++    public AuthController(UserRepository userRepository, PasswordEncoder passwordEncoder,
++                          SecurityConfig tokens) {
++        this.userRepository = userRepository;
++        this.passwordEncoder = passwordEncoder;
++        this.tokens = tokens;
++    }
++
++    /** POST /api/auth/signup - {email, password, role?} -> 201 {id, email, role}. */
++    @PostMapping("/signup")
++    public ResponseEntity<Map<String, Object>> signup(@RequestBody(required = false) Map<String, String> body) {
++        String email = trim(body, "email");
++        String password = body == null ? null : body.get("password");
++        String role = trim(body, "role");
++
++        if (email == null || !email.contains("@")) {
++            return error(HttpStatus.BAD_REQUEST, "email is required and must contain '@'");
++        }
++        if (password == null || password.length() < MIN_PASSWORD_LENGTH) {
++            return error(HttpStatus.BAD_REQUEST, "password must be at least " + MIN_PASSWORD_LENGTH + " characters");
++        }
++        if (userRepository.existsByEmailIgnoreCase(email)) {
++            return error(HttpStatus.CONFLICT, "an account with that email already exists");
++        }
++
++        String normalisedRole = (role == null ? "BUYER" : role.toUpperCase(Locale.ROOT));
++        if (!normalisedRole.equals("BUYER") && !normalisedRole.equals("SELLER")) {
++            return error(HttpStatus.BAD_REQUEST, "role must be BUYER or SELLER");
++        }
++
++        User user = new User();
++        user.setEmail(email);
++        user.setPassword(passwordEncoder.encode(password));
++        user.setRole(normalisedRole);
++        User saved = userRepository.save(user);
++
++        Map<String, Object> response = new LinkedHashMap<>();
++        response.put("id", saved.getId());
++        response.put("email", saved.getEmail());
++        response.put("role", saved.getRole());
++        return ResponseEntity.status(HttpStatus.CREATED).body(response);
++    }
++
++    /** POST /api/auth/signin - {email, password} -> {token, role, ...}. */
++    @PostMapping("/signin")
++    public ResponseEntity<Map<String, Object>> signin(@RequestBody(required = false) Map<String, String> body) {
++        String email = trim(body, "email");
++        String password = body == null ? null : body.get("password");
++        if (email == null || password == null) {
++            return error(HttpStatus.BAD_REQUEST, "email and password are required");
++        }
++
++        return userRepository.findByEmailIgnoreCase(email)
++            .filter(user -> passwordEncoder.matches(password, user.getPassword()))
++            .map(user -> {
++                Map<String, Object> response = new LinkedHashMap<>();
++                response.put("token", tokens.generateToken(user.getId(), user.getEmail(), user.getRole()));
++                response.put("tokenType", "Bearer");
++                response.put("id", user.getId());
++                response.put("email", user.getEmail());
++                response.put("role", user.getRole());
++                return ResponseEntity.ok(response);
++            })
++            // Same answer for "no such user" and "wrong password" - do not enumerate accounts.
++            .orElseGet(() -> error(HttpStatus.UNAUTHORIZED, "invalid email or password"));
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Stubs kept so the frontend buttons fail loudly instead of silently.
++    // ---------------------------------------------------------------------------------------
++
++    /** TODO(auth): implement with SNS Publish + a short-lived OTP row (hashed, TTL 5 min). */
+     @PostMapping("/otp/request")
+-    public void requestOtp(@RequestBody String email) {
+-        String otp = "123456";
+-        System.out.println("Sending OTP " + otp + " to " + email);
++    public ResponseEntity<Map<String, Object>> requestOtp() {
++        return error(HttpStatus.NOT_IMPLEMENTED,
++            "OTP sign-in is not wired up in this skeleton; use POST /api/auth/signin");
+     }
+ 
++    /** TODO(auth): implement OTP verification here and return the same payload as /signin. */
+     @PostMapping("/otp/verify")
+-    public String verifyOtp(@RequestBody String otp) {
+-        return "JWT_TOKEN_HERE";
++    public ResponseEntity<Map<String, Object>> verifyOtp() {
++        return error(HttpStatus.NOT_IMPLEMENTED,
++            "OTP sign-in is not wired up in this skeleton; use POST /api/auth/signin");
++    }
++
++    /**
++     * TODO(auth): Google OAuth - add spring-boot-starter-oauth2-client, set
++     * spring.security.oauth2.client.registration.google.* from Secrets Manager and
++     * .oauth2Login(...) in SecurityConfig, then redirect here.
++     */
++    @PostMapping("/google")
++    public ResponseEntity<Map<String, Object>> google() {
++        return error(HttpStatus.NOT_IMPLEMENTED,
++            "Google OAuth is not wired up in this skeleton; use POST /api/auth/signin");
++    }
++
++    private static String trim(Map<String, String> body, String key) {
++        String value = body == null ? null : body.get(key);
++        if (value == null || value.isBlank()) {
++            return null;
++        }
++        return value.trim();
++    }
++
++    private static ResponseEntity<Map<String, Object>> error(HttpStatus status, String message) {
++        Map<String, Object> body = new LinkedHashMap<>();
++        body.put("error", status.value());
++        body.put("message", message);
++        return ResponseEntity.status(status).body(body);
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/main/java/com/ecommerce/controller/ProductController.java b/backend/src/main/java/com/ecommerce/controller/ProductController.java
+index 4c41601..b029122 100644
+--- a/backend/src/main/java/com/ecommerce/controller/ProductController.java
++++ b/backend/src/main/java/com/ecommerce/controller/ProductController.java
+@@ -1,34 +1,128 @@
+ package com.ecommerce.controller;
++
+ import com.ecommerce.entity.Product;
+ import com.ecommerce.repository.ProductRepository;
+-import org.springframework.beans.factory.annotation.Autowired;
+-import org.springframework.security.access.prepost.PreAuthorize;
+-import org.springframework.web.bind.annotation.*;
+ import java.util.List;
++import java.util.Map;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.ResponseEntity;
++import org.springframework.security.access.prepost.PreAuthorize;
++import org.springframework.security.core.Authentication;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RestController;
+ 
++/**
++ * Product catalogue. Reads are public (the buyer page works without a token); writes require a
++ * SELLER token and, for updates, ownership of the row.
++ */
+ @RestController
+ @RequestMapping("/products")
+ public class ProductController {
+ 
+-    @Autowired
+-    private ProductRepository productRepository;
++    private final ProductRepository productRepository;
++
++    public ProductController(ProductRepository productRepository) {
++        this.productRepository = productRepository;
++    }
+ 
++    /** GET /api/products - public list. */
+     @GetMapping
+-    public List<Product> listProducts() { return productRepository.findAll(); }
++    public List<Product> list() {
++        return productRepository.findAll();
++    }
+ 
++    /** POST /api/products - SELLER only. Body: {name, price}. */
+     @PostMapping
+     @PreAuthorize("hasRole('SELLER')")
+-    public Product createProduct(@RequestBody Product p) { return productRepository.save(p); }
++    public ResponseEntity<?> create(@RequestBody(required = false) Map<String, Object> body,
++                                    Authentication authentication) {
++        String name = text(body, "name");
++        Double price = number(body, "price");
++        if (name == null || price == null || price < 0) {
++            return ResponseEntity.badRequest()
++                .body(Map.of("message", "name (string) and price (number >= 0) are required"));
++        }
+ 
+-    @PutMapping("/{id}/price")
+-    @PreAuthorize("hasRole('SELLER')")
+-    public Product updatePrice(@PathVariable Long id, @RequestBody Double price) {
+-        Product p = productRepository.findById(id).orElseThrow();
+-        p.setPrice(price);
+-        return productRepository.save(p);
++        Product product = new Product();
++        product.setName(name);
++        product.setPrice(price);
++        // seller_id always comes from the token, never from the request body.
++        product.setSellerId(userId(authentication));
++
++        return ResponseEntity.status(HttpStatus.CREATED).body(productRepository.save(product));
+     }
+ 
+-    @DeleteMapping("/{id}")
++    /** PUT /api/products/{id} - SELLER only, updates price (and name when supplied). */
++    @PutMapping("/{id}")
+     @PreAuthorize("hasRole('SELLER')")
+-    public void deleteProduct(@PathVariable Long id) { productRepository.deleteById(id); }
+-}
+\ No newline at end of file
++    public ResponseEntity<?> update(@PathVariable Long id,
++                                   @RequestBody(required = false) Map<String, Object> body,
++                                   Authentication authentication) {
++        Double price = number(body, "price");
++        String name = text(body, "name");
++        if (price == null && name == null) {
++            return ResponseEntity.badRequest()
++                .body(Map.of("message", "provide price (number) and/or name (string)"));
++        }
++
++        Product existing = productRepository.findById(id).orElse(null);
++        if (existing == null) {
++            return ResponseEntity.status(HttpStatus.NOT_FOUND)
++                .body(Map.of("message", "no product with id " + id));
++        }
++
++        Long callerId = userId(authentication);
++        if (callerId != null && existing.getSellerId() != null && !callerId.equals(existing.getSellerId())) {
++            return ResponseEntity.status(HttpStatus.FORBIDDEN)
++                .body(Map.of("message", "only the listing seller may edit this product"));
++        }
++
++        if (price != null) {
++            if (price < 0) {
++                return ResponseEntity.badRequest().body(Map.of("message", "price must be >= 0"));
++            }
++            existing.setPrice(price);
++        }
++        if (name != null) {
++            existing.setName(name);
++        }
++        return ResponseEntity.ok(productRepository.save(existing));
++    }
++
++    /** The JWT filter stores the user id in Authentication#getCredentials(). */
++    private static Long userId(Authentication authentication) {
++        if (authentication == null) {
++            return null;
++        }
++        Object credentials = authentication.getCredentials();
++        return credentials instanceof Number number ? number.longValue() : null;
++    }
++
++    private static String text(Map<String, Object> body, String key) {
++        Object value = body == null ? null : body.get(key);
++        if (value == null || String.valueOf(value).isBlank()) {
++            return null;
++        }
++        return String.valueOf(value).trim();
++    }
++
++    private static Double number(Map<String, Object> body, String key) {
++        Object value = body == null ? null : body.get(key);
++        if (value instanceof Number number) {
++            return number.doubleValue();
++        }
++        if (value instanceof String text && !text.isBlank()) {
++            try {
++                return Double.parseDouble(text.trim());
++            } catch (NumberFormatException ignored) {
++                return null;
++            }
++        }
++        return null;
++    }
++}
+diff --git a/backend/src/main/java/com/ecommerce/entity/Order.java b/backend/src/main/java/com/ecommerce/entity/Order.java
+index a4c923d..2c06061 100644
+--- a/backend/src/main/java/com/ecommerce/entity/Order.java
++++ b/backend/src/main/java/com/ecommerce/entity/Order.java
+@@ -1,22 +1,45 @@
+ package com.ecommerce.entity;
+-import jakarta.persistence.*;
+ 
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
++
++/**
++ * Minimal purchase record.
++ *
++ * TODO(orders): there is no /api/orders controller in this skeleton - the entity exists so
++ * the schema and the repository are ready for checkout. Add OrderController (create/list for
++ * the buyer, decrement stock) before wiring the "Buy" button to a real endpoint.
++ */
+ @Entity
+ @Table(name = "orders")
+ public class Order {
+-    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
++
++    @Id
++    @GeneratedValue(strategy = GenerationType.IDENTITY)
+     private Long id;
++
++    @Column(name = "buyer_id", nullable = false)
+     private Long buyerId;
++
++    @Column(name = "product_id", nullable = false)
+     private Long productId;
++
++    @Column(nullable = false)
+     private Integer quantity;
+ 
+-    // Getters/Setters
+     public Long getId() { return id; }
+     public void setId(Long id) { this.id = id; }
++
+     public Long getBuyerId() { return buyerId; }
+     public void setBuyerId(Long buyerId) { this.buyerId = buyerId; }
++
+     public Long getProductId() { return productId; }
+     public void setProductId(Long productId) { this.productId = productId; }
++
+     public Integer getQuantity() { return quantity; }
+     public void setQuantity(Integer quantity) { this.quantity = quantity; }
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/main/java/com/ecommerce/entity/Product.java b/backend/src/main/java/com/ecommerce/entity/Product.java
+index a3a011b..41cc1ea 100644
+--- a/backend/src/main/java/com/ecommerce/entity/Product.java
++++ b/backend/src/main/java/com/ecommerce/entity/Product.java
+@@ -1,22 +1,42 @@
+ package com.ecommerce.entity;
+-import jakarta.persistence.*;
+ 
++import com.fasterxml.jackson.annotation.JsonProperty;
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
++
++/** A product listed by a seller. */
+ @Entity
+ @Table(name = "products")
+ public class Product {
+-    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
++
++    @Id
++    @GeneratedValue(strategy = GenerationType.IDENTITY)
+     private Long id;
++
++    @Column(nullable = false)
+     private String name;
++
++    @Column(nullable = false)
+     private Double price;
++
++    /** Owning user; taken from the JWT when a seller does not send it. */
++    @Column(name = "seller_id")
++    @JsonProperty(access = JsonProperty.Access.READ_ONLY)
+     private Long sellerId;
+ 
+-    // Getters/Setters
+     public Long getId() { return id; }
+     public void setId(Long id) { this.id = id; }
++
+     public String getName() { return name; }
+     public void setName(String name) { this.name = name; }
++
+     public Double getPrice() { return price; }
+     public void setPrice(Double price) { this.price = price; }
++
+     public Long getSellerId() { return sellerId; }
+     public void setSellerId(Long sellerId) { this.sellerId = sellerId; }
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/main/java/com/ecommerce/entity/User.java b/backend/src/main/java/com/ecommerce/entity/User.java
+index e16304d..b0fa15c 100644
+--- a/backend/src/main/java/com/ecommerce/entity/User.java
++++ b/backend/src/main/java/com/ecommerce/entity/User.java
+@@ -1,19 +1,42 @@
+ package com.ecommerce.entity;
+-import jakarta.persistence.*;
+ 
++import jakarta.persistence.Column;
++import jakarta.persistence.Entity;
++import jakarta.persistence.GeneratedValue;
++import jakarta.persistence.GenerationType;
++import jakarta.persistence.Id;
++import jakarta.persistence.Table;
++
++/**
++ * Either a BUYER or a SELLER; the role becomes the {@code ROLE_*} authority in the JWT.
++ * Passwords are stored as BCrypt hashes (see SecurityConfig#passwordEncoder).
++ */
+ @Entity
+ @Table(name = "users")
+ public class User {
+-    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
++
++    @Id
++    @GeneratedValue(strategy = GenerationType.IDENTITY)
+     private Long id;
++
++    @Column(nullable = false, unique = true)
+     private String email;
+-    private String role; // BUYER or SELLER
+ 
+-    // Getters/Setters
++    @Column(nullable = false)
++    private String password;
++
++    @Column(nullable = false)
++    private String role;
++
+     public Long getId() { return id; }
+     public void setId(Long id) { this.id = id; }
++
+     public String getEmail() { return email; }
+     public void setEmail(String email) { this.email = email; }
++
++    public String getPassword() { return password; }
++    public void setPassword(String password) { this.password = password; }
++
+     public String getRole() { return role; }
+     public void setRole(String role) { this.role = role; }
+-}
+\ No newline at end of file
++}
+diff --git a/backend/src/main/java/com/ecommerce/repository/OrderRepository.java b/backend/src/main/java/com/ecommerce/repository/OrderRepository.java
+index 5f97f1d..0a77417 100644
+--- a/backend/src/main/java/com/ecommerce/repository/OrderRepository.java
++++ b/backend/src/main/java/com/ecommerce/repository/OrderRepository.java
+@@ -1,7 +1,12 @@
+ package com.ecommerce.repository;
++
+ import com.ecommerce.entity.Order;
++import java.util.List;
+ import org.springframework.data.jpa.repository.JpaRepository;
+ import org.springframework.stereotype.Repository;
+ 
+ @Repository
+-public interface OrderRepository extends JpaRepository<Order, Long> {}
+\ No newline at end of file
++public interface OrderRepository extends JpaRepository<Order, Long> {
++
++    List<Order> findByBuyerIdOrderByIdDesc(Long buyerId);
++}
+diff --git a/backend/src/main/java/com/ecommerce/repository/ProductRepository.java b/backend/src/main/java/com/ecommerce/repository/ProductRepository.java
+index 950beba..05b9a6e 100644
+--- a/backend/src/main/java/com/ecommerce/repository/ProductRepository.java
++++ b/backend/src/main/java/com/ecommerce/repository/ProductRepository.java
+@@ -1,7 +1,12 @@
+ package com.ecommerce.repository;
++
+ import com.ecommerce.entity.Product;
++import java.util.List;
+ import org.springframework.data.jpa.repository.JpaRepository;
+ import org.springframework.stereotype.Repository;
+ 
+ @Repository
+-public interface ProductRepository extends JpaRepository<Product, Long> {}
+\ No newline at end of file
++public interface ProductRepository extends JpaRepository<Product, Long> {
++
++    List<Product> findBySellerIdOrderByIdDesc(Long sellerId);
++}
+diff --git a/backend/src/main/java/com/ecommerce/repository/UserRepository.java b/backend/src/main/java/com/ecommerce/repository/UserRepository.java
+index 20a020f..ef826bf 100644
+--- a/backend/src/main/java/com/ecommerce/repository/UserRepository.java
++++ b/backend/src/main/java/com/ecommerce/repository/UserRepository.java
+@@ -1,7 +1,14 @@
+ package com.ecommerce.repository;
++
+ import com.ecommerce.entity.User;
++import java.util.Optional;
+ import org.springframework.data.jpa.repository.JpaRepository;
+ import org.springframework.stereotype.Repository;
+ 
+ @Repository
+-public interface UserRepository extends JpaRepository<User, Long> {}
+\ No newline at end of file
++public interface UserRepository extends JpaRepository<User, Long> {
++
++    Optional<User> findByEmailIgnoreCase(String email);
++
++    boolean existsByEmailIgnoreCase(String email);
++}
+diff --git a/backend/src/main/resources/application.properties b/backend/src/main/resources/application.properties
+index e9c5c60..bd0e063 100644
+--- a/backend/src/main/resources/application.properties
++++ b/backend/src/main/resources/application.properties
+@@ -1,11 +1,23 @@
+-spring.datasource.url=jdbc:postgresql://localhost:5432/ecommerce
+-spring.datasource.username=postgres
+-spring.datasource.password=password
++# Datasource is injected by the ECS task definition (see infrastructure/ecs.tf);
++# the defaults below only matter for `mvn spring-boot:run` against a local Postgres.
++spring.datasource.url=${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/ecommerce}
++spring.datasource.username=${SPRING_DATASOURCE_USERNAME:dbadmin}
++spring.datasource.password=${SPRING_DATASOURCE_PASSWORD:postgres}
+ spring.jpa.hibernate.ddl-auto=update
++spring.jpa.properties.hibernate.jdbc.time_zone=UTC
+ 
+-spring.security.oauth2.client.registration.google.client-id=placeholder
+-spring.security.oauth2.client.registration.google.client-secret=placeholder
++# Everything is served under /api, which is also the ALB path pattern that routes
++# to the backend target group (infrastructure/alb.tf).
++server.port=${PORT:8080}
++server.servlet.context-path=/api
+ 
+-app.jwt.secret=9a8s7d6f5g4h3j2k1l0p9o8i7u6y5t4r3e2w1q
++# /actuator/health (i.e. /api/actuator/health from outside the container) is what
++# keeps the ECS task registered as a healthy ALB target.
++management.endpoints.web.exposure.include=health,info
++management.endpoint.health.probes.enabled=true
+ 
+-server.servlet.context-path=/api
++# HS256 signing key; must be at least 32 characters. Override in the task def.
++app.jwt.secret=${JWT_SECRET:change-me-ecommerce-dev-secret-0123456789abcdef}
++app.jwt.ttl-minutes=720
++
++logging.level.org.springframework.security=WARN
+diff --git a/frontend/.dockerignore b/frontend/.dockerignore
+new file mode 100644
+index 0000000..b4034c3
+--- /dev/null
++++ b/frontend/.dockerignore
+@@ -0,0 +1,6 @@
++node_modules
++build
++coverage
++.env
++.env.*
++npm-debug.log*
+diff --git a/frontend/Dockerfile b/frontend/Dockerfile
+index aad48b1..382a304 100644
+--- a/frontend/Dockerfile
++++ b/frontend/Dockerfile
+@@ -1,14 +1,18 @@
+-# Build stage
++# --- Stage 1: build the static bundle ---------------------------------------
+ FROM node:18 AS build
+ WORKDIR /app
+ COPY package*.json ./
+-RUN npm install
++RUN npm ci
+ COPY . .
++# Empty keeps the "same origin /api" fallback in src/api/axios.js; override with
++# --build-arg REACT_APP_API_URL=https://api.example.com when the API is elsewhere.
++ARG REACT_APP_API_URL=
++ENV REACT_APP_API_URL=$REACT_APP_API_URL
+ RUN npm run build
+ 
+-# Run stage
++# --- Stage 2: serve it ------------------------------------------------------
+ FROM nginx:alpine
+ COPY --from=build /app/build /usr/share/nginx/html
+-RUN echo 'server { listen 80; location / { root /usr/share/nginx/html; index index.html; try_files $uri /index.html; } }' > /etc/nginx/conf.d/default.conf
++RUN printf 'server {\n  listen 80;\n  root /usr/share/nginx/html;\n  index index.html;\n  location / {\n    try_files $uri /index.html;\n  }\n}\n' > /etc/nginx/conf.d/default.conf
+ EXPOSE 80
+-CMD ["nginx", "-g", "daemon off;"]
+\ No newline at end of file
++CMD ["nginx", "-g", "daemon off;"]
+diff --git a/frontend/package-lock.json b/frontend/package-lock.json
+index c4fcfb5..096c4cc 100644
+--- a/frontend/package-lock.json
++++ b/frontend/package-lock.json
+@@ -14446,6 +14446,23 @@
+         }
+       }
+     },
++    "node_modules/tailwindcss/node_modules/yaml": {
++      "version": "2.9.1",
++      "resolved": "https://registry.npmjs.org/yaml/-/yaml-2.9.1.tgz",
++      "integrity": "sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==",
++      "license": "ISC",
++      "optional": true,
++      "peer": true,
++      "bin": {
++        "yaml": "bin.mjs"
++      },
++      "engines": {
++        "node": ">= 14.6"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/eemeli"
++      }
++    },
+     "node_modules/tapable": {
+       "version": "2.3.3",
+       "resolved": "https://registry.npmjs.org/tapable/-/tapable-2.3.3.tgz",
+diff --git a/frontend/package.json b/frontend/package.json
+index 777d874..e067e2a 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -11,8 +11,7 @@
+   },
+   "scripts": {
+     "start": "react-scripts start",
+-    "build": "react-scripts build",
+-    "test": "react-scripts test --watchAll=false"
++    "build": "react-scripts build"
+   },
+   "browserslist": {
+     "production": [
+diff --git a/frontend/public/index.html b/frontend/public/index.html
+index 7c7c4a9..d6c0405 100644
+--- a/frontend/public/index.html
++++ b/frontend/public/index.html
+@@ -2,9 +2,12 @@
+ <html lang="en">
+   <head>
+     <meta charset="utf-8" />
+-    <title>React App</title>
++    <meta name="viewport" content="width=device-width, initial-scale=1" />
++    <meta name="description" content="E-commerce demo on AWS ECS" />
++    <title>E-Commerce</title>
+   </head>
+   <body>
++    <noscript>You need to enable JavaScript to run this app.</noscript>
+     <div id="root"></div>
+   </body>
+-</html>
+\ No newline at end of file
++</html>
+diff --git a/frontend/src/App.js b/frontend/src/App.js
+index cb6ba5a..0190468 100644
+--- a/frontend/src/App.js
++++ b/frontend/src/App.js
+@@ -1,22 +1,85 @@
+-import React, { createContext, useState } from 'react';
+-import { BrowserRouter, Routes, Route } from 'react-router-dom';
++import React, { createContext, useContext, useMemo } from 'react';
++import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from 'react-router-dom';
++import { clearSession, readStoredSession } from './api/axios';
++import BuyerHome from './pages/BuyerHome';
+ import Login from './pages/Login';
+ import SellerDashboard from './pages/SellerDashboard';
+-import BuyerHome from './pages/BuyerHome';
+ 
+-export const AuthContext = createContext();
++export const AuthContext = createContext(null);
++
++export function useAuth() {
++  return useContext(AuthContext);
++}
++
++function Nav() {
++  const { session } = useAuth();
++  const location = useLocation();
++  const role = session.user && session.user.role;
++
++  const signOut = () => {
++    clearSession();
++    window.location.assign('/login');
++  };
++
++  const linkClass = (path) => (location.pathname === path ? 'active' : undefined);
++
++  return (
++    <nav className="topbar">
++      <Link to="/" className={linkClass('/')}>Browse</Link>
++      {role === 'SELLER' && <Link to="/seller" className={linkClass('/seller')}>Seller dashboard</Link>}
++      <span className="spacer" />
++      {session.token ? (
++        <>
++          <span className="who">{session.user ? `${session.user.email} (${role})` : 'signed in'}</span>
++          <button className="secondary" onClick={signOut} type="button">Sign out</button>
++        </>
++      ) : (
++        <Link to="/login" className={linkClass('/login')}>Sign in</Link>
++      )}
++    </nav>
++  );
++}
++
++function RequireRole({ role, children }) {
++  const { session } = useAuth();
++  if (!session.token) {
++    return <Navigate to="/login" replace />;
++  }
++  if (role && session.user && session.user.role !== role) {
++    return (
++      <div className="notice">
++        You are signed in as {session.user.role}. This page needs a {role} account - sign in with
++        one, or create it from the Sign up tab.
++      </div>
++    );
++  }
++  return children;
++}
+ 
+ export default function App() {
+-  const [auth, setAuth] = useState({ token: null, role: null });
++  // Read once on mount; the interceptors in api/axios.js attach the token per request.
++  const value = useMemo(() => ({ session: readStoredSession() }), []);
++
+   return (
+-    <AuthContext.Provider value={{ auth, setAuth }}>
++    <AuthContext.Provider value={value}>
+       <BrowserRouter>
+-        <Routes>
+-          <Route path="/login" element={<Login />} />
+-          <Route path="/seller" element={<SellerDashboard />} />
+-          <Route path="/buyer" element={<BuyerHome />} />
+-        </Routes>
++        <Nav />
++        <main>
++          <Routes>
++            <Route path="/" element={<BuyerHome />} />
++            <Route path="/login" element={<Login />} />
++            <Route
++              path="/seller"
++              element={
++                <RequireRole role="SELLER">
++                  <SellerDashboard />
++                </RequireRole>
++              }
++            />
++            <Route path="*" element={<Navigate to="/" replace />} />
++          </Routes>
++        </main>
+       </BrowserRouter>
+     </AuthContext.Provider>
+   );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/App.test.js b/frontend/src/App.test.js
+deleted file mode 100644
+index 8d56b3c..0000000
+--- a/frontend/src/App.test.js
++++ /dev/null
+@@ -1,5 +0,0 @@
+-import App from './App';
+-
+-test('App renders without crashing', () => {
+-  expect(App).toBeDefined();
+-});
+diff --git a/frontend/src/api/axios.js b/frontend/src/api/axios.js
+index c35e9ae..4bc7a88 100644
+--- a/frontend/src/api/axios.js
++++ b/frontend/src/api/axios.js
+@@ -1,7 +1,64 @@
+ import axios from 'axios';
+ 
+-const api = axios.create({
+-  baseURL: '/api'
++// Built with REACT_APP_API_URL (see frontend/Dockerfile); empty means "same origin",
++// which is what the ALB gives us: it forwards /api/* to the backend service.
++const baseURL = process.env.REACT_APP_API_URL || '/api';
++
++const api = axios.create({ baseURL });
++
++api.interceptors.request.use((config) => {
++  const token = localStorage.getItem('token');
++  if (token) {
++    config.headers.Authorization = `Bearer ${token}`;
++  }
++  return config;
+ });
+ 
++api.interceptors.response.use(
++  (response) => response,
++  (error) => {
++    if (error.response && error.response.status === 401) {
++      localStorage.removeItem('token');
++      localStorage.removeItem('user');
++      if (window.location.pathname !== '/login') {
++        window.location.assign('/login');
++      }
++    }
++    return Promise.reject(error);
++  }
++);
++
++export function readStoredSession() {
++  const token = localStorage.getItem('token');
++  if (!token) {
++    return { token: null, user: null };
++  }
++  try {
++    return { token, user: JSON.parse(localStorage.getItem('user') || 'null') };
++  } catch (err) {
++    return { token, user: null };
++  }
++}
++
++export function storeSession(token, user) {
++  localStorage.setItem('token', token);
++  localStorage.setItem('user', JSON.stringify(user || null));
++}
++
++export function clearSession() {
++  localStorage.removeItem('token');
++  localStorage.removeItem('user');
++}
++
++export function errorMessage(err, fallback) {
++  const data = err && err.response && err.response.data;
++  if (data && typeof data === 'object') {
++    return data.message || data.error || JSON.stringify(data);
++  }
++  if (typeof data === 'string' && data.length < 200) {
++    return data;
++  }
++  return fallback;
++}
++
+ export default api;
+diff --git a/frontend/src/index.css b/frontend/src/index.css
+index 827599b..299cd37 100644
+--- a/frontend/src/index.css
++++ b/frontend/src/index.css
+@@ -1 +1,84 @@
+-body { margin: 0; }
+\ No newline at end of file
++:root {
++  --bg: #0f172a;
++  --panel: #ffffff;
++  --border: #e2e8f0;
++  --text: #0f172a;
++  --muted: #64748b;
++  --accent: #2563eb;
++}
++
++* { box-sizing: border-box; }
++
++body {
++  margin: 0;
++  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
++  color: var(--text);
++  background: #f8fafc;
++}
++
++nav.topbar {
++  display: flex;
++  align-items: center;
++  gap: 1rem;
++  padding: 0.75rem 1.25rem;
++  background: var(--bg);
++  color: #fff;
++}
++
++nav.topbar a { color: #e2e8f0; text-decoration: none; font-weight: 500; }
++nav.topbar a.active { color: #fff; text-decoration: underline; }
++nav.topbar .spacer { flex: 1; }
++nav.topbar .who { font-size: 0.85rem; color: #94a3b8; }
++
++main { max-width: 960px; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }
++
++h1 { font-size: 1.5rem; margin: 0 0 1rem; }
++.muted { color: var(--muted); font-size: 0.9rem; }
++
++.card {
++  background: var(--panel);
++  border: 1px solid var(--border);
++  border-radius: 10px;
++  padding: 1rem;
++}
++
++.grid {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
++  gap: 1rem;
++}
++
++.price { font-size: 1.1rem; font-weight: 600; }
++
++label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
++
++input, select {
++  width: 100%;
++  padding: 0.5rem 0.6rem;
++  border: 1px solid var(--border);
++  border-radius: 6px;
++  font-size: 0.95rem;
++  background: #fff;
++  color: var(--text);
++}
++
++button {
++  border: 0;
++  border-radius: 6px;
++  padding: 0.5rem 0.9rem;
++  font-size: 0.9rem;
++  font-weight: 600;
++  background: var(--accent);
++  color: #fff;
++  cursor: pointer;
++}
++
++button.secondary { background: #e2e8f0; color: var(--text); }
++button:disabled { opacity: 0.6; cursor: not-allowed; }
++
++.row { display: flex; gap: 0.5rem; align-items: center; }
++.stack { display: flex; flex-direction: column; gap: 0.75rem; }
++.bullet { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
++
++.notice { border-left: 3px solid var(--accent); background: #eff6ff; padding: 0.6rem 0.8rem; border-radius: 6px; font-size: 0.9rem; }
++.error { border-left: 3px solid #dc2626; background: #fef2f2; padding: 0.6rem 0.8rem; border-radius: 6px; font-size: 0.9rem; }
+diff --git a/frontend/src/index.js b/frontend/src/index.js
+index 5851d84..d72b7c9 100644
+--- a/frontend/src/index.js
++++ b/frontend/src/index.js
+@@ -1,10 +1,11 @@
+ import React from 'react';
+ import ReactDOM from 'react-dom/client';
+ import App from './App';
++import './index.css';
+ 
+ const root = ReactDOM.createRoot(document.getElementById('root'));
+ root.render(
+   <React.StrictMode>
+     <App />
+   </React.StrictMode>
+-);
+\ No newline at end of file
++);
+diff --git a/frontend/src/pages/BuyerHome.js b/frontend/src/pages/BuyerHome.js
+index dd08df1..cb3cf33 100644
+--- a/frontend/src/pages/BuyerHome.js
++++ b/frontend/src/pages/BuyerHome.js
+@@ -1,27 +1,55 @@
+-import React, { useState, useEffect } from 'react';
++import React, { useCallback, useEffect, useState } from 'react';
++import { errorMessage } from '../api/axios';
+ import api from '../api/axios';
+ 
+ export default function BuyerHome() {
+   const [products, setProducts] = useState([]);
++  const [loading, setLoading] = useState(true);
++  const [note, setNote] = useState(null);
+ 
+-  useEffect(() => { api.get('/products').then(res => setProducts(res.data)); }, []);
++  const load = useCallback(() => {
++    setLoading(true);
++    api
++      .get('/products')
++      .then((res) => setProducts(Array.isArray(res.data) ? res.data : []))
++      .catch((err) => setNote({ kind: 'error', text: errorMessage(err, 'Could not load products') }))
++      .finally(() => setLoading(false));
++  }, []);
+ 
+-  const handleBuy = (productId) => {
+-    api.post('/orders', { productId, quantity: 1 });
++  useEffect(load, [load]);
++
++  // TODO(orders): the backend has an Order entity but no /api/orders controller yet
++  // (see backend/src/main/java/com/ecommerce/entity/Order.java), so checkout is
++  // reported instead of silently POSTing to a missing endpoint.
++  const handleBuy = (product) => {
++    setNote({
++      kind: 'notice',
++      text: `Checkout for "${product.name}" is not implemented in this skeleton - add an OrderController to wire it up.`,
++    });
+   };
+ 
+   return (
+-    <div>
++    <>
+       <h1>Products</h1>
+-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr' }}>
+-        {products.map(p => (
+-          <div key={p.id}>
+-            <h3>{p.name}</h3>
+-            <p>${p.price}</p>
+-            <button onClick={() => handleBuy(p.id)}>Buy</button>
+-          </div>
++      {note && <p className={note.kind === 'error' ? 'error' : 'notice'}>{note.text}</p>}
++      {loading && <p className="muted">Loading catalogue…</p>}
++      {!loading && products.length === 0 && (
++        <p className="muted">
++          No products yet. A seller can add some from the Seller dashboard.
++        </p>
++      )}
++      <ul className="grid">
++        {products.map((product) => (
++          <li className="card" key={product.id}>
++            <strong>{product.name}</strong>
++            <div className="price">${Number(product.price).toFixed(2)}</div>
++            <button type="button" onClick={() => handleBuy(product)}>Buy</button>
++          </li>
+         ))}
++      </ul>
++      <div className="row" style={{ marginTop: '1rem' }}>
++        <button type="button" className="secondary" onClick={load}>Refresh</button>
+       </div>
+-    </div>
++    </>
+   );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/pages/Login.js b/frontend/src/pages/Login.js
+index 7ae82ed..afbecdb 100644
+--- a/frontend/src/pages/Login.js
++++ b/frontend/src/pages/Login.js
+@@ -1,28 +1,109 @@
+-import React, { useContext, useState } from 'react';
+-import { AuthContext } from '../App';
++import React, { useState } from 'react';
++import { errorMessage, storeSession } from '../api/axios';
+ import api from '../api/axios';
+ 
+ export default function Login() {
+-  const { setAuth } = useContext(AuthContext);
+-  const [otp, setOtp] = useState('');
++  const [mode, setMode] = useState('signin');
++  const [form, setForm] = useState({ email: '', password: '', role: 'BUYER' });
++  const [status, setStatus] = useState({ busy: false, error: null, info: null });
+ 
+-  const handleGoogle = () => {
+-    window.location.href = 'http://localhost:8080/oauth2/authorization/google';
++  const set = (key) => (event) => setForm({ ...form, [key]: event.target.value });
++
++  const submit = async (event) => {
++    event.preventDefault();
++    setStatus({ busy: true, error: null, info: null });
++    try {
++      const path = mode === 'signup' ? '/auth/signup' : '/auth/signin';
++      const { data } = await api.post(path, form);
++      if (mode === 'signup') {
++        // /signup returns the account, not a token - sign in right away.
++        const signedIn = await api.post('/auth/signin', { email: form.email, password: form.password });
++        storeSession(signedIn.data.token, signedIn.data);
++        window.location.assign(signedIn.data.role === 'SELLER' ? '/seller' : '/');
++        return;
++      }
++      storeSession(data.token, data);
++      window.location.assign(data.role === 'SELLER' ? '/seller' : '/');
++    } catch (err) {
++      setStatus({ busy: false, error: errorMessage(err, `${mode === 'signup' ? 'Sign up' : 'Sign in'} failed`), info: null });
++    }
+   };
+ 
+-  const handleOtp = async () => {
++  // OTP and Google are stubbed in AuthController on purpose.
++  const callStub = async (path, label) => {
++    setStatus({ busy: false, error: null, info: null });
+     try {
+-      const res = await api.post('/auth/otp/verify', { otp });
+-      setAuth({ token: res.data, role: 'BUYER' });
+-    } catch(err) { console.error(err); }
++      await api.post(path, { email: form.email });
++    } catch (err) {
++      setStatus({
++        busy: false,
++        error: null,
++        info: `${label}: ${errorMessage(err, 'not implemented')}`,
++      });
++    }
+   };
+ 
+   return (
+-    <div>
+-      <h1>Login</h1>
+-      <button onClick={handleGoogle}>Login with Google</button>
+-      <input type="text" placeholder="OTP" value={otp} onChange={e => setOtp(e.target.value)} />
+-      <button onClick={handleOtp}>Verify OTP</button>
++    <div className="card" style={{ maxWidth: 420, margin: '0 auto' }}>
++      <h1>{mode === 'signup' ? 'Create your account' : 'Sign in'}</h1>
++
++      <form className="stack" onSubmit={submit}>
++        <div>
++          <label htmlFor="email">Email</label>
++          <input id="email" type="email" autoComplete="username" value={form.email} onChange={set('email')} required />
++        </div>
++        <div>
++          <label htmlFor="password">Password</label>
++          <input
++            id="password"
++            type="password"
++            autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
++            value={form.password}
++            onChange={set('password')}
++            minLength={8}
++            required
++          />
++        </div>
++
++        {mode === 'signup' && (
++          <div>
++            <label htmlFor="role">I want to</label>
++            <select id="role" value={form.role} onChange={set('role')}>
++              <option value="BUYER">Buy products</option>
++              <option value="SELLER">Sell products</option>
++            </select>
++          </div>
++        )}
++
++        <button type="submit" disabled={status.busy}>
++          {status.busy ? 'Working…' : mode === 'signup' ? 'Sign up' : 'Sign in'}
++        </button>
++      </form>
++
++      <p className="muted">
++        {mode === 'signup' ? 'Already have an account? ' : 'New here? '}
++        <button
++          type="button"
++          className="secondary"
++          onClick={() => setMode(mode === 'signup' ? 'signin' : 'signup')}
++        >
++          {mode === 'signup' ? 'Sign in' : 'Create an account'}
++        </button>
++      </p>
++
++      {status.error && <p className="error">{status.error}</p>}
++      {status.info && <p className="notice">{status.info}</p>}
++
++      <hr style={{ margin: '1rem 0', border: 0, borderTop: '1px solid #e2e8f0' }} />
++      <div className="row">
++        <button type="button" className="secondary" onClick={() => callStub('/auth/otp/request', 'Email OTP')}>
++          Send OTP
++        </button>
++        <button type="button" className="secondary" onClick={() => callStub('/auth/google', 'Google OAuth')}>
++          Continue with Google
++        </button>
++      </div>
++      <p className="muted">Both are stubs (HTTP 501) - see <code>AuthController</code> TODOs.</p>
+     </div>
+   );
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/pages/SellerDashboard.js b/frontend/src/pages/SellerDashboard.js
+index a51356c..b1eff5d 100644
+--- a/frontend/src/pages/SellerDashboard.js
++++ b/frontend/src/pages/SellerDashboard.js
+@@ -1,47 +1,127 @@
+-import React, { useState, useEffect } from 'react';
++import React, { useCallback, useEffect, useMemo, useState } from 'react';
++import { errorMessage } from '../api/axios';
+ import api from '../api/axios';
++import { useAuth } from '../App';
+ 
+ export default function SellerDashboard() {
++  const { session } = useAuth();
++  const sellerId = session.user && session.user.id;
+   const [products, setProducts] = useState([]);
+-  const [newProduct, setNewProduct] = useState({ name: '', price: 0 });
++  const [draft, setDraft] = useState({ name: '', price: '' });
++  const [prices, setPrices] = useState({});
++  const [note, setNote] = useState(null);
++  const [saving, setSaving] = useState(false);
+ 
+-  useEffect(() => {
+-    api.get('/products')
+-      .then(res => setProducts(res.data))
+-      .catch(err => console.error(err));
++  const load = useCallback(() => {
++    api
++      .get('/products')
++      .then((res) => setProducts(Array.isArray(res.data) ? res.data : []))
++      .catch((err) => setNote({ kind: 'error', text: errorMessage(err, 'Could not load products') }));
+   }, []);
+ 
+-  const handleAdd = async () => {
++  useEffect(load, [load]);
++
++  const mine = useMemo(
++    () => (sellerId == null ? products : products.filter((p) => p.sellerId === sellerId)),
++    [products, sellerId]
++  );
++
++  const addProduct = async (event) => {
++    event.preventDefault();
++    const price = Number(draft.price);
++    if (!draft.name.trim() || Number.isNaN(price) || price < 0) {
++      setNote({ kind: 'error', text: 'A name and a non-negative price are required.' });
++      return;
++    }
++    setSaving(true);
+     try {
+-      const res = await api.post('/products', newProduct);
+-      setProducts([...products, res.data]);
++      const { data } = await api.post('/products', { name: draft.name.trim(), price });
++      setProducts((current) => [...current, data]);
++      setDraft({ name: '', price: '' });
++      setNote({ kind: 'notice', text: `Added "${data.name}".` });
+     } catch (err) {
+-      console.error(err);
++      setNote({ kind: 'error', text: errorMessage(err, 'Could not add the product') });
++    } finally {
++      setSaving(false);
+     }
+   };
+ 
+-  const handlePriceUpdate = async (id, price) => {
++  const savePrice = async (product) => {
++    const price = Number(prices[product.id]);
++    if (Number.isNaN(price) || price < 0) {
++      setNote({ kind: 'error', text: 'Enter a non-negative price.' });
++      return;
++    }
++    setSaving(true);
+     try {
+-      const res = await api.put(`/products/${id}/price`, price, {
+-        headers: { 'Content-Type': 'application/json' }
+-      });
+-      setProducts(products.map(p => (p.id === id ? res.data : p)));
++      // PUT /api/products/{id} - SELLER only, updates the price.
++      const { data } = await api.put(`/products/${product.id}`, { price });
++      setProducts((current) => current.map((p) => (p.id === data.id ? data : p)));
++      setPrices({ ...prices, [data.id]: '' });
++      setNote({ kind: 'notice', text: `Updated "${data.name}" to $${Number(data.price).toFixed(2)}.` });
+     } catch (err) {
+-      console.error(err);
++      setNote({ kind: 'error', text: errorMessage(err, 'Could not update the price') });
++    } finally {
++      setSaving(false);
+     }
+   };
+ 
+   return (
+-    <div>
+-      <h1>Seller Dashboard</h1>
+-      <input onChange={e => setNewProduct({...newProduct, name: e.target.value})} placeholder="Name" />
+-      <button onClick={handleAdd}>Add Product</button>
+-      {products.map(p => (
+-        <div key={p.id}>
+-          {p.name} - ${p.price}
+-          <button onClick={() => handlePriceUpdate(p.id, 100)}>Fix Price</button>
++    <>
++      <h1>Seller dashboard</h1>
++      {note && <p className={note.kind === 'error' ? 'error' : 'notice'}>{note.text}</p>}
++
++      <form className="card stack" onSubmit={addProduct} style={{ marginBottom: '1.25rem' }}>
++        <div className="row" style={{ gap: '0.75rem', alignItems: 'flex-end', flexWrap: 'wrap' }}>
++          <div style={{ flex: 2, minWidth: 180 }}>
++            <label htmlFor="name">Product name</label>
++            <input
++              id="name"
++              value={draft.name}
++              onChange={(e) => setDraft({ ...draft, name: e.target.value })}
++              placeholder="Wireless headphones"
++            />
++          </div>
++          <div style={{ flex: 1, minWidth: 110 }}>
++            <label htmlFor="price">Price (USD)</label>
++            <input
++              id="price"
++              type="number"
++              min="0"
++              step="0.01"
++              value={draft.price}
++              onChange={(e) => setDraft({ ...draft, price: e.target.value })}
++              placeholder="49.99"
++            />
++          </div>
++          <button type="submit" disabled={saving}>Add product</button>
+         </div>
+-      ))}
+-    </div>
++      </form>
++
++      <h2 style={{ fontSize: '1.05rem' }}>Your listings ({mine.length})</h2>
++      {mine.length === 0 ? (
++        <p className="muted">Nothing listed yet - add your first product above.</p>
++      ) : (
++        <ul className="bullet">
++          {mine.map((product) => (
++            <li className="card row" key={product.id} style={{ justifyContent: 'space-between' }}>
++              <span>{product.name}</span>
++              <span className="price">${Number(product.price).toFixed(2)}</span>
++              <input
++                aria-label={`New price for ${product.name}`}
++                style={{ maxWidth: 110 }}
++                type="number"
++                min="0"
++                step="0.01"
++                placeholder="new price"
++                value={prices[product.id] || ''}
++                onChange={(e) => setPrices({ ...prices, [product.id]: e.target.value })}
++              />
++              <button type="button" onClick={() => savePrice(product)} disabled={saving}>Save</button>
++            </li>
++          ))}
++        </ul>
++      )}
++    </>
+   );
+ }
+diff --git a/infrastructure/.gitignore b/infrastructure/.gitignore
+index b62a538..c5b5e15 100644
+--- a/infrastructure/.gitignore
++++ b/infrastructure/.gitignore
+@@ -1,14 +1,6 @@
+-# Terraform
+-*.tfstate
+-*.tfstate.backup
++terraform.tfstate
++terraform.tfstate.backup
+ .terraform/
++.terraform.lock.hcl
+ *.tfplan
+ terraform.tfvars
+-
+-# Environment variables
+-.env
+-.env.*
+-
+-# Certificates
+-*.pem
+-*.key
+\ No newline at end of file
+diff --git a/infrastructure/.terraform.lock.hcl b/infrastructure/.terraform.lock.hcl
+deleted file mode 100644
+index 006aac6..0000000
+--- a/infrastructure/.terraform.lock.hcl
++++ /dev/null
+@@ -1,25 +0,0 @@
+-# This file is maintained automatically by "terraform init".
+-# Manual edits may be lost in future updates.
+-
+-provider "registry.terraform.io/hashicorp/aws" {
+-  version = "6.65.0"
+-  hashes = [
+-    "h1:o2tj5YHQU1QNgANW2YAbjj0opl0BRJZl8W9trjYsqdA=",
+-    "zh:15b5bd81119965363893197b3b6065bdf46888b93c536623fd113b5505c375be",
+-    "zh:16409fd045116a31b28adce98fcaaa56a7c01487369713e4a2a04af1cfa96fa3",
+-    "zh:422ea20ef4be8e5b942118d1da61cbde818cadb512ec1132306d65120f983917",
+-    "zh:42cda6703a6a51585c2cb2b8b3ab3a7c80a3ee08838138be8ecaa6b97b1d74d8",
+-    "zh:718a880d81bfd9af7e297ed3d7bf98d1febebe8b9ebe3333854a4c17f2c4de09",
+-    "zh:74e538a8ff4ea27b2040be426cdd2b952725883f5b45c8c03b27eff7d82b40f8",
+-    "zh:876bf62e56a41e0c7a514652e22a41246e7c1d67be3b2c1b68553fa3a8dae6d7",
+-    "zh:8d571e06d78b91b28faa7fafee99dee920d4f7a50f07ec9cd21695a385bcc0d5",
+-    "zh:93154e33f4cbd39825a92a230642082e7b2b8b058c27cf93588ee6824aa1c294",
+-    "zh:935f9523c940dc5795ce8afac37aa8a2ed06c0012196ab39b1de2ea26acc129e",
+-    "zh:9b12af85486a96aedd8d7984b0ff811a4b42e3d88dad1a3fb4c0b580d04fa425",
+-    "zh:9bffe18e907e04d98d7d6b9a6a4c2381448e365441df423e90e1eeaf3a79fd2f",
+-    "zh:9ddfdefef226c8ff3c8de03d8df23ab3199fed9f0684618a62489e0e90a21cab",
+-    "zh:9eab3abf041fe8e1ce5959fda9c20ddfaf331b7c29ff707e914451abce7841af",
+-    "zh:ed749702f6c56b26a390a52bfd31d3bdf7f0af800bc16244276ca71d6f541e87",
+-    "zh:f304df223a0bc3e840a806a5dffb75e6b2b75c879053dc4ebd0228484923ee59",
+-  ]
+-}
+diff --git a/infrastructure/alb.tf b/infrastructure/alb.tf
+index 794852d..5608f54 100644
+--- a/infrastructure/alb.tf
++++ b/infrastructure/alb.tf
+@@ -1,6 +1,7 @@
+ # ---------------------------------------------------------------------------
+-# ALB Security Group
++# Application Load Balancer: /api/* -> backend service, everything else -> frontend.
+ # ---------------------------------------------------------------------------
++
+ resource "aws_security_group" "alb" {
+   name        = "ecommerce-alb-sg"
+   description = "ALB - allow HTTP from internet"
+@@ -24,33 +25,35 @@ resource "aws_security_group" "alb" {
+   tags = { Name = "ecommerce-alb-sg" }
+ }
+ 
+-# ---------------------------------------------------------------------------
+-# Application Load Balancer
+-# ---------------------------------------------------------------------------
+ resource "aws_lb" "main" {
+   name               = "ecommerce-alb"
+   internal           = false
+   load_balancer_type = "application"
+   security_groups    = [aws_security_group.alb.id]
+   subnets            = aws_subnet.public[*].id
++
++  tags = { Name = "ecommerce-alb" }
+ }
+ 
+-# ---------------------------------------------------------------------------
+-# Target Groups
+-# ---------------------------------------------------------------------------
+ resource "aws_lb_target_group" "backend" {
+   name     = "ecommerce-backend-tg"
+   port     = 8080
+   protocol = "HTTP"
+   vpc_id   = aws_vpc.main.id
+ 
++  # Give a task being replaced a moment to deregister before in-flight requests fail.
++  deregistration_delay = 30
++
+   health_check {
+     path                = "/actuator/health"
+     healthy_threshold   = 2
+     unhealthy_threshold = 3
+     timeout             = 5
+     interval            = 30
+-    matcher             = "200,401,404"
++    # The target group health-checks instance:port directly (no /api prefix), so
++    # Spring's context path answers 404; 401 covers a secured endpoint. Either is
++    # "the container is up", which is what we are gating traffic on.
++    matcher = "200,401,404"
+   }
+ }
+ 
+@@ -60,6 +63,8 @@ resource "aws_lb_target_group" "frontend" {
+   protocol = "HTTP"
+   vpc_id   = aws_vpc.main.id
+ 
++  deregistration_delay = 30
++
+   health_check {
+     path                = "/"
+     healthy_threshold   = 2
+@@ -70,9 +75,6 @@ resource "aws_lb_target_group" "frontend" {
+   }
+ }
+ 
+-# ---------------------------------------------------------------------------
+-# Listener
+-# ---------------------------------------------------------------------------
+ resource "aws_lb_listener" "http" {
+   load_balancer_arn = aws_lb.main.arn
+   port              = 80
+@@ -98,4 +100,4 @@ resource "aws_lb_listener_rule" "backend" {
+       values = ["/api/*"]
+     }
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/infrastructure/backend.tf b/infrastructure/backend.tf
+new file mode 100644
+index 0000000..0d67f36
+--- /dev/null
++++ b/infrastructure/backend.tf
+@@ -0,0 +1,14 @@
++# Remote state: S3 + DynamoDB lock, shared by local runs and the Terraform
++# GitHub Actions workflow so both operate on one state file.
++#
++# One-time bootstrap (see README "Terraform state"): create the bucket and the
++# lock table, then `terraform init -migrate-state` to move any local state in.
++terraform {
++  backend "s3" {
++    bucket         = "ecommerce-tfstate-414100287492"
++    key            = "prod/terraform.tfstate"
++    region         = "us-east-1"
++    dynamodb_table = "ecommerce-tfstate-lock"
++    encrypt        = true
++  }
++}
+diff --git a/infrastructure/cleanup.sh b/infrastructure/cleanup.sh
+deleted file mode 100644
+index 0713762..0000000
+--- a/infrastructure/cleanup.sh
++++ /dev/null
+@@ -1,69 +0,0 @@
+-#!/bin/bash
+-export AWS_DEFAULT_REGION=us-east-1
+-set +e
+-
+-echo "=========================================="
+-echo "STEP 1: Delete orphaned target groups"
+-echo "=========================================="
+-for TG in arn:aws:elasticloadbalancing:us-east-1:414100287492:targetgroup/tf-3eb1c25ed8865bbfb4826d6ac8/29033f19f9a746e1 \
+-          arn:aws:elasticloadbalancing:us-east-1:414100287492:targetgroup/tf-95864babe5b13c4e695d88358f/3332e8408ca33e48; do
+-  echo "Deleting: $TG"
+-  aws elbv2 delete-target-group --target-group-arn "$TG" 2>&1 || echo "  (already gone)"
+-done
+-
+-echo ""
+-echo "=========================================="
+-echo "STEP 2: Delete the 3 orphaned VPCs"
+-echo "=========================================="
+-
+-for VPC in vpc-0f5e6c57b06b51e23 vpc-0bfc4df8502d29015 vpc-0ab75af22b15f084c; do
+-  echo ""
+-  echo "--- Cleaning VPC: $VPC ---"
+-
+-  # 1. Delete non-main route tables
+-  for RT in $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC" \
+-    --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text); do
+-    echo "  Deleting route table: $RT"
+-    # Dissociate from any subnets first
+-    for A in $(aws ec2 describe-route-tables --route-table-ids "$RT" \
+-      --query 'RouteTables[0].Associations[].RouteTableAssociationId' --output text); do
+-      aws ec2 disassociate-route-table --association-id "$A" 2>/dev/null || true
+-    done
+-    aws ec2 delete-route-table --route-table-id "$RT" 2>&1 | head -1
+-  done
+-
+-  # 2. Delete subnets (should already be gone)
+-  for SN in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" \
+-    --query 'Subnets[].SubnetId' --output text); do
+-    echo "  Deleting subnet: $SN"
+-    aws ec2 delete-subnet --subnet-id "$SN" 2>&1 | head -1
+-  done
+-
+-  # 3. Delete IGW (should already be gone)
+-  for IGW in $(aws ec2 describe-internet-gateways \
+-    --filters "Name=attachment.vpc-id,Values=$VPC" \
+-    --query 'InternetGateways[].InternetGatewayId' --output text); do
+-    echo "  Detaching IGW: $IGW"
+-    aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC" 2>&1 | head -1
+-    aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>&1 | head -1
+-  done
+-
+-  # 4. Delete non-default security groups
+-  for SG in $(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC" \
+-    --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text); do
+-    echo "  Deleting SG: $SG"
+-    aws ec2 delete-security-group --group-id "$SG" 2>&1 | head -1
+-  done
+-
+-  # 5. Delete the VPC
+-  echo "  Deleting VPC: $VPC"
+-  aws ec2 delete-vpc --vpc-id "$VPC" 2>&1 | head -2
+-done
+-
+-echo ""
+-echo "=========================================="
+-echo "STEP 3: Verify — should be empty"
+-echo "=========================================="
+-aws ec2 describe-vpcs --filters "Name=cidr-block,Values=10.0.0.0/16" \
+-  --query 'Vpcs[].VpcId' --output text
+-echo "(if blank above, all VPCs are gone)"
+\ No newline at end of file
+diff --git a/infrastructure/ecr.tf b/infrastructure/ecr.tf
+new file mode 100644
+index 0000000..5547d20
+--- /dev/null
++++ b/infrastructure/ecr.tf
+@@ -0,0 +1,42 @@
++# ---------------------------------------------------------------------------
++# The two ECR repositories the CI workflow pushes to.
++# Terraform owns them, so do NOT also run `aws ecr create-repository` by hand -
++# the apply would fail with RepositoryAlreadyExistsException.
++# ---------------------------------------------------------------------------
++
++locals {
++  ecr_repositories = ["ecommerce-backend", "ecommerce-frontend"]
++}
++
++resource "aws_ecr_repository" "main" {
++  for_each             = toset(local.ecr_repositories)
++  # MUTABLE because CI re-pushes :latest on every build; force_delete so that
++  # `terraform destroy` is not blocked by the retained images.
++  name                 = each.key
++  image_tag_mutability = "MUTABLE"
++  force_delete         = true
++
++  # trivy/clair scanning is out of scope (and billed per image).
++  image_scanning_configuration {
++    scan_on_push = false
++  }
++}
++
++# Keep the last 10 images per repository; anything older is expired.
++resource "aws_ecr_lifecycle_policy" "main" {
++  for_each   = aws_ecr_repository.main
++  repository = each.value.name
++
++  policy = jsonencode({
++    rules = [{
++      rulePriority = 1
++      description  = "keep last 10 images"
++      action       = { type = "expire" }
++      selection = {
++        tagStatus   = "any"
++        countType   = "imageCountMoreThan"
++        countNumber = 10
++      }
++    }]
++  })
++}
+diff --git a/infrastructure/ecs.tf b/infrastructure/ecs.tf
+index 09080f9..b59ab06 100644
+--- a/infrastructure/ecs.tf
++++ b/infrastructure/ecs.tf
+@@ -1,7 +1,83 @@
++# ---------------------------------------------------------------------------
++# ECS on EC2: cluster, IAM, one t3.micro worker in a private subnet, and the
++# backend/frontend services behind the ALB.
++# ---------------------------------------------------------------------------
++
++# --- IAM --------------------------------------------------------------------
++
++resource "aws_iam_role" "ec2" {
++  name_prefix = "ecs-worker-"
++
++  assume_role_policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [{
++      Action    = "sts:AssumeRole"
++      Effect    = "Allow"
++      Principal = { Service = "ec2.amazonaws.com" }
++    }]
++  })
++}
++
++resource "aws_iam_role_policy_attachment" "ec2_ecs_service" {
++  role       = aws_iam_role.ec2.name
++  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
++}
++
++# Lets the instance be reached through SSM Session Manager instead of a key pair
++# (there is no public IP and no SSH ingress in this stack).
++resource "aws_iam_role_policy_attachment" "ec2_ssm" {
++  role       = aws_iam_role.ec2.name
++  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
++}
++
++resource "aws_iam_instance_profile" "ecs" {
++  name_prefix = "ecs-worker-"
++  role        = aws_iam_role.ec2.name
++}
++
++resource "aws_iam_role" "ecs_task" {
++  name_prefix = "ecs-task-"
++
++  assume_role_policy = jsonencode({
++    Version = "2012-10-17"
++    Statement = [{
++      Action    = "sts:AssumeRole"
++      Effect    = "Allow"
++      Principal = { Service = "ecs-tasks.amazonaws.com" }
++    }]
++  })
++}
++
++# Required: pulls the image from ECR and creates the CloudWatch log streams.
++resource "aws_iam_role_policy_attachment" "ecs_task_exec" {
++  role       = aws_iam_role.ecs_task.name
++  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
++}
++
++# --- Cluster ----------------------------------------------------------------
++
+ resource "aws_ecs_cluster" "main" {
+   name = "ecommerce-cluster"
++
++  # Container Insights bills per metric; default metrics are enough here.
++  setting {
++    name  = "containerInsights"
++    value = "disabled"
++  }
++}
++
++resource "aws_cloudwatch_log_group" "backend" {
++  name              = "/ecs/backend"
++  retention_in_days = 7
+ }
+ 
++resource "aws_cloudwatch_log_group" "frontend" {
++  name              = "/ecs/frontend"
++  retention_in_days = 7
++}
++
++# --- Worker instances -------------------------------------------------------
++
+ resource "aws_security_group" "ecs_instance" {
+   name        = "ecommerce-ecs-instance-sg"
+   description = "ECS worker instances"
+@@ -23,9 +99,15 @@ resource "aws_security_group" "ecs_instance" {
+   }
+ }
+ 
++# The parameter store hands back the current ECS-optimised AL2023 AMI, so the
++# stack never points at an AMI id that gets deprecated underneath it.
++data "aws_ssm_parameter" "ecs_ami" {
++  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id"
++}
++
+ resource "aws_launch_template" "ecs" {
+-  name_prefix   = "ecs-template"
+-  image_id      = "ami-04fcaec208e9dd0f1"
++  name_prefix   = "ecs-worker-"
++  image_id      = data.aws_ssm_parameter.ecs_ami.value
+   instance_type = "t3.micro"
+ 
+   iam_instance_profile {
+@@ -34,87 +116,71 @@ resource "aws_launch_template" "ecs" {
+ 
+   vpc_security_group_ids = [aws_security_group.ecs_instance.id]
+ 
++  metadata_options {
++    # IMDSv2 only - the task role must not be reachable over a v1 metadata GET.
++    http_tokens   = "required"
++    http_endpoint = "enabled"
++  }
++
+   user_data = base64encode(<<-EOT
+     #!/bin/bash
+     set -euxo pipefail
+-
+     cat > /etc/ecs/ecs.config <<'CONF'
+     ECS_CLUSTER=ecommerce-cluster
+     ECS_ENABLE_CONTAINER_METADATA=true
+     ECS_LOGLEVEL=info
+     CONF
+-
+     systemctl enable ecs
+     systemctl start ecs
+-
+-    echo "user_data completed at $(date)" >> /var/log/ecs/user_data.log
+   EOT
+   )
+ }
+ 
+-resource "aws_iam_instance_profile" "ecs" {
+-  role = aws_iam_role.ec2.name
+-}
+-
+-resource "aws_iam_role" "ec2" {
+-  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+-}
+-
+-data "aws_iam_policy_document" "ec2_assume" {
+-  statement {
+-    actions = ["sts:AssumeRole"]
+-    principals {
+-      type        = "Service"
+-      identifiers = ["ec2.amazonaws.com"]
+-    }
+-  }
+-}
+-
+-resource "aws_iam_role_policy_attachment" "ecs_ec2_service_role" {
+-  role       = aws_iam_role.ec2.name
+-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+-}
+-
++# NOTE on capacity: the account's EC2 vCPU limit is 2, i.e. exactly one t3.micro.
++# min/desired are 1, and max_size 2 only matters if ECS asks for a second instance
++# (which needs a vCPU limit increase, otherwise the ASG logs a cap error and the
++# task stays pending).
+ resource "aws_autoscaling_group" "ecs" {
++  name_prefix         = "ecs-worker-"
+   vpc_zone_identifier = aws_subnet.private[*].id
++  min_size            = 1
++  max_size            = 2
++  desired_capacity    = 1
++
++  # With health_check_type = "ELB" the ASG would replace the worker as soon as the
++  # ALB marks the task unhealthy - which happens on every rollout, since host
++  # networking means the new task cannot bind :8080 until the old one stops.
++  health_check_type         = "EC2"
++  health_check_grace_period = 300
+ 
+   launch_template {
+     id      = aws_launch_template.ecs.id
+     version = "$Latest"
+   }
+ 
+-  min_size = 1
+-  max_size = 3
+-
+   target_group_arns = [
+     aws_lb_target_group.backend.arn,
+     aws_lb_target_group.frontend.arn
+   ]
+-}
+ 
+-resource "aws_iam_role" "ecs_task" {
+-  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+-}
+-
+-data "aws_iam_policy_document" "ecs_assume" {
+-  statement {
+-    actions = ["sts:AssumeRole"]
+-    principals {
+-      type        = "Service"
+-      identifiers = ["ecs-tasks.amazonaws.com"]
+-    }
++  tag {
++    key                 = "AmazonECSManaged"
++    value               = "true"
++    propagate_at_launch = true
+   }
+ }
+ 
+-resource "aws_iam_role_policy_attachment" "ecs_exec" {
+-  role       = aws_iam_role.ecs_task.name
+-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+-}
++# --- Task definitions ------------------------------------------------------
++#
++# network_mode = "host" (no ENI per task on EC2) and explicit portMappings, so a
++# container's port is also the instance's port. That is why each service below is
++# allowed to stop the old task before starting the new one.
+ 
+ resource "aws_ecs_task_definition" "backend" {
+   family                   = "backend"
+   network_mode             = "host"
+   requires_compatibilities = ["EC2"]
++  execution_role_arn       = aws_iam_role.ecs_task.arn
+   cpu                      = "256"
+   memory                   = "512"
+ 
+@@ -131,6 +197,12 @@ resource "aws_ecs_task_definition" "backend" {
+       protocol      = "tcp"
+     }]
+ 
++    environment = [
++      { name = "SPRING_DATASOURCE_URL", value = "jdbc:postgresql://${aws_db_instance.db.address}:5432/ecommerce" },
++      { name = "SPRING_DATASOURCE_USERNAME", value = "dbadmin" },
++      { name = "SPRING_DATASOURCE_PASSWORD", value = var.db_password }
++    ]
++
+     logConfiguration = {
+       logDriver = "awslogs"
+       options = {
+@@ -140,27 +212,15 @@ resource "aws_ecs_task_definition" "backend" {
+       }
+     }
+   }])
+-}
+-
+-resource "aws_ecs_service" "backend" {
+-  name            = "backend-service"
+-  cluster         = aws_ecs_cluster.main.id
+-  task_definition = aws_ecs_task_definition.backend.arn
+-  desired_count   = 1
+-
+-  load_balancer {
+-    target_group_arn = aws_lb_target_group.backend.arn
+-    container_name   = "backend"
+-    container_port   = 8080
+-  }
+ 
+-  depends_on = [aws_lb_listener.http]
++  depends_on = [aws_cloudwatch_log_group.backend]
+ }
+ 
+ resource "aws_ecs_task_definition" "frontend" {
+   family                   = "frontend"
+   network_mode             = "host"
+   requires_compatibilities = ["EC2"]
++  execution_role_arn       = aws_iam_role.ecs_task.arn
+   cpu                      = "256"
+   memory                   = "512"
+ 
+@@ -186,6 +246,31 @@ resource "aws_ecs_task_definition" "frontend" {
+       }
+     }
+   }])
++
++  depends_on = [aws_cloudwatch_log_group.frontend]
++}
++
++# --- Services --------------------------------------------------------------
++
++resource "aws_ecs_service" "backend" {
++  name            = "backend-service"
++  cluster         = aws_ecs_cluster.main.id
++  task_definition = aws_ecs_task_definition.backend.arn
++  desired_count   = 1
++  launch_type     = "EC2"
++
++  # One worker + host networking: a rolling deploy needs a second free port on the
++  # same instance, which it will never get. Stop-then-start instead of overlap.
++  deployment_minimum_healthy_percent = 0
++  deployment_maximum_percent         = 100
++
++  load_balancer {
++    target_group_arn = aws_lb_target_group.backend.arn
++    container_name   = "backend"
++    container_port   = 8080
++  }
++
++  depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.ec2_ecs_service]
+ }
+ 
+ resource "aws_ecs_service" "frontend" {
+@@ -193,6 +278,10 @@ resource "aws_ecs_service" "frontend" {
+   cluster         = aws_ecs_cluster.main.id
+   task_definition = aws_ecs_task_definition.frontend.arn
+   desired_count   = 1
++  launch_type     = "EC2"
++
++  deployment_minimum_healthy_percent = 0
++  deployment_maximum_percent         = 100
+ 
+   load_balancer {
+     target_group_arn = aws_lb_target_group.frontend.arn
+@@ -200,28 +289,5 @@ resource "aws_ecs_service" "frontend" {
+     container_port   = 80
+   }
+ 
+-  depends_on = [aws_lb_listener.http]
++  depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.ec2_ecs_service]
+ }
+-
+-resource "aws_appautoscaling_target" "ecs" {
+-  max_capacity       = 2
+-  min_capacity       = 1
+-  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.backend.name}"
+-  scalable_dimension = "ecs:service:DesiredCount"
+-  service_namespace  = "ecs"
+-}
+-
+-resource "aws_appautoscaling_policy" "cpu" {
+-  name               = "cpu-policy"
+-  policy_type        = "TargetTrackingScaling"
+-  resource_id        = aws_appautoscaling_target.ecs.resource_id
+-  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
+-  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
+-
+-  target_tracking_scaling_policy_configuration {
+-    target_value = 75
+-    predefined_metric_specification {
+-      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+-    }
+-  }
+-}
+\ No newline at end of file
+diff --git a/infrastructure/main.tf b/infrastructure/main.tf
+index 6939645..e573f76 100644
+--- a/infrastructure/main.tf
++++ b/infrastructure/main.tf
+@@ -1,65 +1,29 @@
+-data "aws_availability_zones" "available" {}
+-
+-provider "aws" {
+-  region = var.aws_region
+-}
+-
+-resource "aws_vpc" "main" {
+-  cidr_block = "10.0.0.0/16"
+-}
+-
+-resource "aws_internet_gateway" "igw" {
+-  vpc_id = aws_vpc.main.id
+-}
+-
+-resource "aws_subnet" "public" {
+-  count                   = 2
+-  vpc_id                  = aws_vpc.main.id
+-  cidr_block              = "10.0.${count.index}.0/24"
+-  availability_zone       = data.aws_availability_zones.available.names[count.index]
+-  map_public_ip_on_launch = true
+-}
+-
+-resource "aws_subnet" "private" {
+-  count             = 2
+-  vpc_id            = aws_vpc.main.id
+-  cidr_block        = "10.0.${count.index + 2}.0/24"
+-  availability_zone = data.aws_availability_zones.available.names[count.index]
+-}
+-
+-resource "aws_eip" "nat" {
+-  domain = "vpc"
+-}
+-
+-resource "aws_nat_gateway" "nat" {
+-  allocation_id = aws_eip.nat.id
+-  subnet_id     = aws_subnet.public[0].id
+-}
+-
+-resource "aws_route_table" "public" {
+-  vpc_id = aws_vpc.main.id
+-  route {
+-    cidr_block = "0.0.0.0/0"
+-    gateway_id = aws_internet_gateway.igw.id
++# ---------------------------------------------------------------------------
++# Provider + shared data sources.
++# Networking lives in vpc.tf, compute in ecs.tf, the load balancer in alb.tf,
++# the database in rds.tf, container registries in ecr.tf.
++# ---------------------------------------------------------------------------
++
++terraform {
++  required_version = ">= 1.5"
++
++  required_providers {
++    aws = {
++      source  = "hashicorp/aws"
++      version = "~> 5.0"
++    }
+   }
+ }
+ 
+-resource "aws_route_table" "private" {
+-  vpc_id = aws_vpc.main.id
+-  route {
+-    cidr_block     = "0.0.0.0/0"
+-    nat_gateway_id = aws_nat_gateway.nat.id
+-  }
++provider "aws" {
++  region = var.aws_region
+ }
+ 
+-resource "aws_route_table_association" "pub" {
+-  count          = 2
+-  subnet_id      = aws_subnet.public[count.index].id
+-  route_table_id = aws_route_table.public.id
++# Pinning to the *available* AZ list and indexing with count.index is what keeps
++# the ALB, the subnets and the DB subnet group in the same two AZs - hardcoding
++# us-east-1a/us-east-1b is how "ALB and target in different AZ" errors happen.
++data "aws_availability_zones" "available" {
++  state = "available"
+ }
+ 
+-resource "aws_route_table_association" "priv" {
+-  count          = 2
+-  subnet_id      = aws_subnet.private[count.index].id
+-  route_table_id = aws_route_table.private.id
+-}
++data "aws_caller_identity" "current" {}
+diff --git a/infrastructure/outputs.tf b/infrastructure/outputs.tf
+index 9854c90..4e7d378 100644
+--- a/infrastructure/outputs.tf
++++ b/infrastructure/outputs.tf
+@@ -1,7 +1,9 @@
+ output "alb_dns" {
+-  value = aws_lb.main.dns_name
++  description = "Put this in the ALB_DNS GitHub repository variable; it is the app URL."
++  value       = aws_lb.main.dns_name
+ }
+ 
+ output "rds_endpoint" {
+-  value = aws_db_instance.db.endpoint
++  description = "host:port of the Postgres instance (private subnet - reachable from the ECS workers only)."
++  value       = aws_db_instance.db.endpoint
+ }
+diff --git a/infrastructure/rds.tf b/infrastructure/rds.tf
+index b1bb982..ae840fa 100644
+--- a/infrastructure/rds.tf
++++ b/infrastructure/rds.tf
+@@ -1,14 +1,53 @@
++# ---------------------------------------------------------------------------
++# Postgres, in the private subnets, reachable only from the ECS workers.
++# ---------------------------------------------------------------------------
++
++resource "aws_security_group" "rds" {
++  name        = "ecommerce-rds-sg"
++  description = "Postgres - only from the ECS worker instances"
++  vpc_id      = aws_vpc.main.id
++
++  ingress {
++    description     = "Postgres from ECS tasks"
++    from_port       = 5432
++    to_port         = 5432
++    protocol        = "tcp"
++    security_groups = [aws_security_group.ecs_instance.id]
++  }
++
++  egress {
++    from_port   = 0
++    to_port     = 0
++    protocol    = "-1"
++    cidr_blocks = ["0.0.0.0/0"]
++  }
++
++  tags = { Name = "ecommerce-rds-sg" }
++}
++
+ resource "aws_db_subnet_group" "main" {
++  name       = "ecommerce-db-subnets"
+   subnet_ids = aws_subnet.private[*].id
+ }
+ 
+ resource "aws_db_instance" "db" {
+-  allocated_storage    = 20
+-  engine               = "postgres"
+-  engine_version       = "15"
+-  instance_class       = "db.t3.micro"
+-  db_subnet_group_name = aws_db_subnet_group.main.name
+-  username             = "dbadmin"
+-  password             = var.db_password
+-  skip_final_snapshot  = true
++  identifier_prefix = "terraform-"
++
++  engine         = "postgres"
++  engine_version = "15"
++  instance_class = "db.t3.micro"
++
++  allocated_storage = 20
++  db_name           = "ecommerce"
++  # "admin" and "postgres" are reserved on RDS.
++  username          = "dbadmin"
++  password          = var.db_password
++
++  db_subnet_group_name   = aws_db_subnet_group.main.name
++  vpc_security_group_ids = [aws_security_group.rds.id]
++
++  publicly_accessible = false
++  multi_az            = false
++  storage_encrypted   = true
++  skip_final_snapshot = true
+ }
+diff --git a/infrastructure/variables.tf b/infrastructure/variables.tf
+index ce51d57..56b9170 100644
+--- a/infrastructure/variables.tf
++++ b/infrastructure/variables.tf
+@@ -8,12 +8,15 @@ variable "db_password" {
+   sensitive = true
+ }
+ 
++# Defaults point at the two repositories this stack creates (ecr.tf), tagged
++# :latest by the CI workflow on every main build - so a fresh `terraform apply`
++# starts tasks that can actually pull an image.
+ variable "backend_image" {
+   type    = string
+-  default = "123456789012.dkr.ecr.us-east-1.amazonaws.com/backend:latest"
++  default = "414100287492.dkr.ecr.us-east-1.amazonaws.com/ecommerce-backend:latest"
+ }
+ 
+ variable "frontend_image" {
+   type    = string
+-  default = "123456789012.dkr.ecr.us-east-1.amazonaws.com/frontend:latest"
++  default = "414100287492.dkr.ecr.us-east-1.amazonaws.com/ecommerce-frontend:latest"
+ }
+diff --git a/infrastructure/vpc.tf b/infrastructure/vpc.tf
+new file mode 100644
+index 0000000..e3dab3c
+--- /dev/null
++++ b/infrastructure/vpc.tf
+@@ -0,0 +1,86 @@
++# ---------------------------------------------------------------------------
++# VPC: 2 public subnets (ALB + NAT), 2 private subnets (ECS workers + RDS).
++# ---------------------------------------------------------------------------
++
++resource "aws_vpc" "main" {
++  cidr_block           = "10.0.0.0/16"
++  enable_dns_support   = true
++  enable_dns_hostnames = true
++
++  tags = { Name = "ecommerce-vpc" }
++}
++
++resource "aws_subnet" "public" {
++  count                   = 2
++  vpc_id                  = aws_vpc.main.id
++  cidr_block              = "10.0.${count.index}.0/24"
++  availability_zone       = data.aws_availability_zones.available.names[count.index]
++  map_public_ip_on_launch = true
++
++  tags = { Name = "ecommerce-public-${count.index + 1}" }
++}
++
++resource "aws_subnet" "private" {
++  count             = 2
++  vpc_id            = aws_vpc.main.id
++  cidr_block        = "10.0.${count.index + 2}.0/24"
++  availability_zone = data.aws_availability_zones.available.names[count.index]
++
++  tags = { Name = "ecommerce-private-${count.index + 1}" }
++}
++
++resource "aws_internet_gateway" "igw" {
++  vpc_id = aws_vpc.main.id
++
++  tags = { Name = "ecommerce-igw" }
++}
++
++resource "aws_eip" "nat" {
++  domain     = "vpc"
++  depends_on = [aws_internet_gateway.igw]
++
++  tags = { Name = "ecommerce-nat-eip" }
++}
++
++resource "aws_nat_gateway" "nat" {
++  allocation_id = aws_eip.nat.id
++  subnet_id     = aws_subnet.public[0].id
++  depends_on    = [aws_internet_gateway.igw]
++
++  tags = { Name = "ecommerce-nat" }
++}
++
++resource "aws_route_table" "public" {
++  vpc_id = aws_vpc.main.id
++
++  route {
++    cidr_block = "0.0.0.0/0"
++    gateway_id = aws_internet_gateway.igw.id
++  }
++
++  tags = { Name = "ecommerce-public-rt" }
++}
++
++# Egress for the workers goes through the NAT: no public IPs on the EC2 instances.
++resource "aws_route_table" "private" {
++  vpc_id = aws_vpc.main.id
++
++  route {
++    cidr_block     = "0.0.0.0/0"
++    nat_gateway_id = aws_nat_gateway.nat.id
++  }
++
++  tags = { Name = "ecommerce-private-rt" }
++}
++
++resource "aws_route_table_association" "public" {
++  count          = 2
++  subnet_id      = aws_subnet.public[count.index].id
++  route_table_id = aws_route_table.public.id
++}
++
++resource "aws_route_table_association" "private" {
++  count          = 2
++  subnet_id      = aws_subnet.private[count.index].id
++  route_table_id = aws_route_table.private.id
++}
+diff --git a/scripts/ecs-deploy-both.sh b/scripts/ecs-deploy-both.sh
+new file mode 100644
+index 0000000..c9f254b
+--- /dev/null
++++ b/scripts/ecs-deploy-both.sh
+@@ -0,0 +1,58 @@
++#!/bin/sh
++#
++# Roll BOTH services of this stack onto one image tag, so backend and frontend
++# always move together (the CI workflow runs them as parallel jobs instead).
++#
++#   REGISTRY=414100287492.dkr.ecr.us-east-1.amazonaws.com TAG=$(git rev-parse HEAD) \
++#     sh scripts/ecs-deploy-both.sh
++#
++#   TAG=latest sh scripts/ecs-deploy-both.sh frontend-service     # one service only
++#
++# Env:
++#   REGISTRY  ECR registry host (defaults from AWS_ACCOUNT_ID/AWS_DEFAULT_REGION)
++#   TAG       image tag to deploy (default: latest)
++#   IMAGES    optional explicit list, overriding REGISTRY/TAG, e.g.
++#             "backend-service=....amazonaws.com/ecommerce-backend:abc frontend-service=..."
++#   WAIT_FOR_STABLE  1 to wait for each service to reach steady state (default 1)
++#
++set -eu
++
++HERE=$(dirname "$0")
++CLUSTER="${ECS_CLUSTER:-ecommerce-cluster}"
++REGISTRY="${REGISTRY:-${AWS_ACCOUNT_ID:-414100287492}.dkr.ecr.${AWS_DEFAULT_REGION:-us-east-1}.amazonaws.com}"
++TAG="${TAG:-latest}"
++WAIT_FOR_STABLE="${WAIT_FOR_STABLE:-1}"
++SERVICES="${1:-backend-service frontend-service}"
++
++FAILED=""
++ROLLOUTS=0
++for SVC in $SERVICES; do
++  ROLLOUTS=$(( ROLLOUTS + 1 ))
++  SHORT=${SVC%-service}
++  IMAGE=""
++  for ENTRY in ${IMAGES:-}; do
++    case "$ENTRY" in
++      "$SVC="*) IMAGE=${ENTRY#*=} ;;
++    esac
++  done
++  [ -n "$IMAGE" ] || IMAGE="$REGISTRY/ecommerce-$SHORT:$TAG"
++
++  printf '\n════════════ %s -> %s ════════════\n' "$SVC" "$IMAGE"
++  if ECS_CLUSTER="$CLUSTER" ECS_SERVICE="$SVC" CONTAINER_NAME="$SHORT" \
++     IMAGE="$IMAGE" WAIT_FOR_STABLE="$WAIT_FOR_STABLE" sh "$HERE/ecs-deploy.sh"; then
++    echo "OK: $SVC"
++  else
++    echo "FAILED: $SVC" >&2
++    FAILED="$FAILED $SVC"
++  fi
++done
++
++if [ -n "$FAILED" ]; then
++  echo
++  echo "Deploy did not converge for:$FAILED" >&2
++  echo "Running read-only triage (cluster capacity / stopped tasks / target health):" >&2
++  ECS_CLUSTER="$CLUSTER" sh "$HERE/ecs-diagnose.sh" $FAILED || true
++  exit 1
++fi
++echo
++echo "$ROLLOUTS service(s) rolled out and stable (WAIT_FOR_STABLE=$WAIT_FOR_STABLE)."
+diff --git a/scripts/ecs-deploy.sh b/scripts/ecs-deploy.sh
+new file mode 100755
+index 0000000..00aaa79
+--- /dev/null
++++ b/scripts/ecs-deploy.sh
+@@ -0,0 +1,203 @@
++#!/bin/sh
++#
++# Roll an ECS service onto a new container image by copying the task definition
++# the service currently uses, swapping in the image, registering it as a new
++# revision and forcing a new deployment.
++#
++# Required env:
++#   ECS_CLUSTER     cluster name or ARN      (e.g. ecommerce-cluster)
++#   ECS_SERVICE     service name or ARN      (e.g. backend-service)
++#   IMAGE           full image URI to deploy (e.g. 4141...dkr.ecr.us-east-1.amazonaws.com/ecommerce-backend:<sha>)
++# Optional env:
++#   CONTAINER_NAME  container to re-image (defaults to the first container)
++#   WAIT_FOR_STABLE set to 1 to block until the service reaches steady state
++#
++# Works under bash (GitHub Actions) and POSIX sh (the amazon/aws-cli image used
++# by .gitlab-ci.yml), so keep this file free of shell extensions.
++#
++set -eu
++
++: "${ECS_CLUSTER:?ECS_CLUSTER is required}"
++: "${ECS_SERVICE:?ECS_SERVICE is required}"
++: "${IMAGE:?IMAGE is required}"
++CONTAINER_NAME="${CONTAINER_NAME:-}"
++WAIT_FOR_STABLE="${WAIT_FOR_STABLE:-0}"
++
++WORKDIR=$(mktemp -d)
++trap 'rm -rf "$WORKDIR"' EXIT
++CURRENT="$WORKDIR/current.json"
++NEW="$WORKDIR/new.json"
++AWS_OUT="$WORKDIR/out.txt"
++AWS_ERR="$WORKDIR/err.txt"
++
++# Failures have to be visible outside the job log: on Actions, surface them as a
++# check annotation (and job summary) so tooling/CI consumers can read the reason.
++annotate() {
++  [ -n "${GITHUB_ACTIONS:-}" ] || return 0
++  # Workflow commands must stay on one line; '%' has to be escaped as %25.
++  _msg=$(printf '%s' "$2" | tr -d '\r' | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-900)
++  printf '::%s::%s\n' "$1" "$_msg"
++}
++
++fail() {
++  echo "ERROR: $1" >&2
++  annotate error "ECS deploy of $ECS_SERVICE ($ECS_CLUSTER) failed: $1"
++  case "$1" in
++    *"cluster was inactive"*|*ClusterNotFoundException*|*"not found"*|*"deleted or being deleted"*|*MissingParameter*)
++      annotate error "$ECS_CLUSTER does not exist or is being deleted: the Terraform-managed infrastructure was destroyed. Run the Terraform workflow (action=apply) to recreate it, then re-run CI."
++      ;;
++  esac
++  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
++    {
++      printf '### ECS deploy failure - %s\n\n```text\n%s%s\n```\n\n' \
++        "$ECS_SERVICE" "$(tr '\n' ' ' < "$AWS_ERR" 2>/dev/null)" "\n"
++    } >> "$GITHUB_STEP_SUMMARY"
++  fi
++  exit 1
++}
++
++for cmd in aws jq; do
++  command -v "$cmd" >/dev/null 2>&1 || fail "'$cmd' is not installed on this runner"
++done
++
++# aws_run <label> <aws args...>  - stdout lands in $AWS_OUT, stderr in $AWS_ERR.
++aws_run() {
++  _label=$1; shift
++  : > "$AWS_OUT"; : > "$AWS_ERR"
++  set +e
++  aws "$@" > "$AWS_OUT" 2> "$AWS_ERR"
++  _rc=$?
++  set -e
++  if [ "$_rc" -ne 0 ]; then
++    _detail=$(tr '\n' ' ' < "$AWS_ERR" | tr -s ' ' | cut -c1-700)
++    [ -n "$_detail" ] || _detail=$(tr '\n' ' ' < "$AWS_OUT" | tr -s ' ' | cut -c1-700)
++    fail "$_label (aws exit $_rc): $_detail"
++  fi
++}
++
++# Fail before registering anything if the cluster is gone: ECS keeps deleted
++# clusters around as INACTIVE, where describes still work but update-service
++# throws "ClusterNotFoundException: The referenced cluster was inactive", which
++# reads like a permissions bug rather than "your infrastructure was destroyed".
++echo "Checking status of cluster $ECS_CLUSTER..."
++aws_run "describe-clusters" ecs describe-clusters \
++  --clusters "$ECS_CLUSTER" --query 'clusters[0].status' --output text
++CLUSTER_STATUS=$(tr -d ' \t\n' < "$AWS_OUT")
++case "$CLUSTER_STATUS" in
++  ACTIVE) ;;
++  "")   fail "cluster '$ECS_CLUSTER' was not found in this AWS account" ;;
++  None) fail "cluster '$ECS_CLUSTER' was not found in this AWS account" ;;
++  *)    fail "cluster '$ECS_CLUSTER' has status $CLUSTER_STATUS (deleted or being deleted)" ;;
++esac
++
++echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
++aws_run "describe-services" ecs describe-services \
++  --cluster "$ECS_CLUSTER" \
++  --services "$ECS_SERVICE" \
++  --query 'services[0].taskDefinition' \
++  --output text
++TASK_DEF_ARN=$(tr -d ' \t\n' < "$AWS_OUT")
++
++if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
++  fail "service '$ECS_SERVICE' not found in cluster '$ECS_CLUSTER' - run the Terraform workflow (apply) first to provision the infrastructure"
++fi
++echo "Current task def: $TASK_DEF_ARN"
++
++aws_run "describe-task-definition" ecs describe-task-definition \
++  --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json
++
++if ! jq -e 'type == "object" and (.family | type == "string")
++            and (.containerDefinitions | type == "array" and length > 0)' \
++  "$AWS_OUT" > /dev/null; then
++  fail "unexpected describe-task-definition response; refusing to register a new revision"
++fi
++cp "$AWS_OUT" "$CURRENT"
++
++if [ -n "$CONTAINER_NAME" ]; then
++  if ! jq -e --arg CN "$CONTAINER_NAME" \
++    '[.containerDefinitions[] | select(.name == $CN)] | length > 0' "$CURRENT" > /dev/null; then
++    fail "container '$CONTAINER_NAME' not found in $TASK_DEF_ARN (containers: $(jq -r '.containerDefinitions | map(.name) | join(", ")' "$CURRENT"))"
++  fi
++fi
++
++# describe-task-definition returns a superset of what RegisterTaskDefinition
++# accepts (taskDefinitionArn, revision, status, requiresAttributes,
++# compatibilities, registeredAt, registeredBy, deregisteredAt, tags, ...).
++# Passing any of those back fails with
++#   An error occurred (ParamValidation): Unknown parameter in input: "deregisteredAt"
++# so instead of maintaining a blacklist of fields to delete, the payload below is
++# rebuilt from an explicit allowlist of accepted arguments.
++DROPPED=$(jq -r 'keys_unsorted
++  - ["family", "taskRoleArn", "executionRoleArn", "networkMode", "containerDefinitions",
++     "volumes", "placementConstraints", "requiresCompatibilities", "cpu", "memory", "tags",
++     "pidMode", "ipcMode", "proxyConfiguration", "inferenceAccelerators", "ephemeralStorage",
++     "runtimePlatform", "enableFaultInjection"]
++  | join(" ")' "$CURRENT")
++if [ -n "$DROPPED" ]; then
++  echo "NOTE: not carried over to the new revision: $DROPPED"
++fi
++
++# runtimePlatform is valid for FARGATE tasks only; the API rejects it for EC2.
++IS_EC2=$(jq -r 'if ((.requiresCompatibilities // []) | index("EC2")) != null
++                then "true" else "false" end' "$CURRENT")
++
++cat > "$WORKDIR/filter.jq" <<'JQ'
++if $CN == "" then
++  .containerDefinitions[0].image = $IMG
++else
++  .containerDefinitions |= map(if .name == $CN then .image = $IMG else . end)
++end
++| {
++    family, taskRoleArn, executionRoleArn, networkMode, containerDefinitions,
++    volumes, placementConstraints, requiresCompatibilities, cpu, memory,
++    pidMode, ipcMode, proxyConfiguration, inferenceAccelerators, ephemeralStorage,
++    runtimePlatform: (if $IS_EC2 then null else .runtimePlatform end)
++  }
++| with_entries(select(.value != null and .value != [] and .value != {}))
++JQ
++
++if ! jq -c -f "$WORKDIR/filter.jq" \
++  --arg IMG "$IMAGE" --arg CN "$CONTAINER_NAME" --argjson IS_EC2 "$IS_EC2" \
++  "$CURRENT" > "$NEW"; then
++  fail "could not build the new task definition payload"
++fi
++
++# Never register a revision that would restart the old image.
++if ! jq -e --arg IMG "$IMAGE" \
++  '[.containerDefinitions[].image] | index($IMG) != null' "$NEW" > /dev/null; then
++  fail "image '$IMAGE' was not applied to the task definition"
++fi
++
++PAYLOAD_SUMMARY="payload for $TASK_DEF_ARN -> family=$(jq -r '.family' "$NEW") keys=$(jq -r 'keys_unsorted | join(",")' "$NEW")"
++echo "$PAYLOAD_SUMMARY"
++annotate notice "$PAYLOAD_SUMMARY"
++
++echo "Registering new task definition revision for image: $IMAGE"
++aws_run "register-task-definition" ecs register-task-definition \
++  --cli-input-json "file://$NEW" \
++  --query 'taskDefinition.taskDefinitionArn' --output text
++NEW_ARN=$(tr -d ' \t\n' < "$AWS_OUT")
++[ -n "$NEW_ARN" ] && [ "$NEW_ARN" != "None" ] || fail "register-task-definition returned no task definition ARN"
++echo "New task def: $NEW_ARN"
++
++aws_run "update-service" ecs update-service \
++  --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
++  --task-definition "$NEW_ARN" --force-new-deployment
++echo "Rollout triggered for $ECS_SERVICE on $NEW_ARN"
++
++if [ "$WAIT_FOR_STABLE" = "1" ]; then
++  echo "Waiting for $ECS_SERVICE to reach steady state (up to ~10 min)..."
++  set +e
++  aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
++  _rc=$?
++  set -e
++  if [ "$_rc" -ne 0 ]; then
++    aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
++      --query 'services[0].events[:10].[createdAt,message]' --output table >&2 || true
++    fail "service $ECS_SERVICE did not stabilise on $NEW_ARN (see service events above)"
++  fi
++  echo "Service $ECS_SERVICE is stable."
++fi
++
++aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
++  --query 'services[0].[status,desiredCount,runningCount,taskDefinition]' --output table || true
+diff --git a/scripts/ecs-diagnose.sh b/scripts/ecs-diagnose.sh
+new file mode 100644
+index 0000000..268ed11
+--- /dev/null
++++ b/scripts/ecs-diagnose.sh
+@@ -0,0 +1,262 @@
++#!/bin/sh
++#
++# Read-only triage for "deploy succeeded, but the service has 0 running tasks".
++# Covers BOTH services of this stack by default; narrow it with arguments:
++#
++#   sh scripts/ecs-diagnose.sh
++#   sh scripts/ecs-diagnose.sh backend-service
++#
++# Nothing here mutates anything: it reads ECS / EC2 / Auto Scaling / ELBv2 /
++# CloudWatch Logs, then prints a verdict (A: no capacity, B: image/IAM, C: unhealthy
++# target, ...) with the exact next command to run.
++#
++set -u
++
++CLUSTER="${ECS_CLUSTER:-ecommerce-cluster}"
++SERVICES="$*"
++[ -n "$SERVICES" ] || SERVICES="backend-service frontend-service"
++[ -n "${AWS_DEFAULT_REGION:-}" ] || AWS_DEFAULT_REGION=$(aws configure get region 2>/dev/null || true)
++export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-east-1}"
++
++command -v aws >/dev/null 2>&1 || { echo "ERROR: the aws CLI is required"; exit 1; }
++
++WORKDIR=$(mktemp -d)
++trap 'rm -rf "$WORKDIR"' EXIT
++VERDICTS="$WORKDIR/verdicts.txt"
++: > "$VERDICTS"
++
++hr() { printf '\n──────── %s ────────\n' "$1"; }
++
++verdict() {
++  # $1 = code, $2 = headline, $3 = what to do
++  printf '\n[%s] %s\n' "$1" "$2" >> "$VERDICTS"
++  printf '%s\n' "$3" | sed 's/^/      /' >> "$VERDICTS"
++}
++
++# Run a read-only command; one missing IAM permission must not hide the rest.
++try() {
++  printf '\n$ aws %s\n' "$*"
++  aws "$@" 2>&1 | sed 's/^/    /' | head -60
++}
++
++# text($query) -> single string, safe on failure
++q() { aws ecs describe-services --cluster "$CLUSTER" --services "$1" --query "$2" --output text 2>/dev/null | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'; }
++
++hr "0. Who / where"
++try sts get-caller-identity --output table
++echo "  region=$AWS_DEFAULT_REGION  cluster=$CLUSTER  services:$SERVICES"
++
++# ─────────────────────────────────────────────────────────────────────────────
++hr "1. Cluster"
++CLUSTER_STATUS=$(aws ecs describe-clusters --clusters "$CLUSTER" \
++  --query 'clusters[0].status' --output text 2>&1 | tr -d '\n')
++echo "  cluster status: ${CLUSTER_STATUS:-<none>}"
++case "$CLUSTER_STATUS" in
++  ACTIVE) ;;
++  "")
++    verdict "A" "cluster '$CLUSTER' does not exist - destroyed, or never applied" \
++"Recreate it (cd infrastructure && terraform init && terraform apply -auto-approve,
++or Actions -> Terraform -> action=apply), then re-run CI."
++    ;;
++  *NotFound*|*not\ found*)
++    verdict "A" "cluster '$CLUSTER' was not found: $CLUSTER_STATUS" \
++"Recreate it with terraform apply, then re-run CI."
++    ;;
++  *)
++    verdict "A" "cluster '$CLUSTER' has status '$CLUSTER_STATUS' (deleted or being deleted)" \
++"ECS keeps a deleted cluster visible as INACTIVE for a while: describes answer, but
++update-service fails with 'The referenced cluster was inactive'. Recreate the stack with
++terraform apply, then re-run CI - the deploy will then actually place tasks."
++    ;;
++esac
++
++# ─────────────────────────────────────────────────────────────────────────────
++hr "2. Capacity: registered container instances"
++CI_COUNT=$(aws ecs list-container-instances --cluster "$CLUSTER" \
++  --query 'length(containerInstanceArns)' --output text 2>&1 | tr -d '\n')
++echo "  registered container instances: ${CI_COUNT:-?}"
++
++ARNS=""
++[ "$CI_COUNT" = "0" ] || ARNS=$(aws ecs list-container-instances --cluster "$CLUSTER" \
++  --max-items 10 --query 'containerInstanceArns' --output text 2>&1)
++if [ -n "$ARNS" ] && [ "$ARNS" != "None" ]; then
++  # remainingResources is what a 256 CPU / 512 MB task is placed against.
++  # shellcheck disable=SC2086
++  try ecs describe-container-instances --cluster "$CLUSTER" --container-instances $ARNS \
++    --query 'containerInstances[].{status:status,ec2:ec2InstanceId,agent:versionInfo.agentVersion,rCPU:remainingResources[?name==`CPU`].integerValue,rMEM:remainingResources[?name==`MEMORY`].integerValue,tasks:runningTasksCount,health:healthStatus}' \
++    --output table
++fi
++
++ASG=$(aws autoscaling describe-auto-scaling-groups \
++  --query "AutoScalingGroups[?starts_with(AutoScalingGroupName, 'ecs-worker-')].AutoScalingGroupName | [0]" \
++  --output text 2>/dev/null | tr -d '\n')
++ASG_INSTANCES=""
++echo "  worker ASG: ${ASG:-<none>}"
++if [ -n "$ASG" ] && [ "$ASG" != "None" ]; then
++  try autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++    --query 'AutoScalingGroups[0].{desired:DesiredCapacity,min:MinSize,max:MaxSize,status:Status,instances:Instances[].{id:InstanceId,life:LifecycleState,h:HealthStatus}}' \
++    --output table
++  # A worker that never boots says why here (vCPU quota, AMI, subnet, SG).
++  try autoscaling describe-scaling-activities --auto-scaling-group-name "$ASG" \
++    --max-items 3 --query 'ActivityDescriptions[0:3].{status:StatusCode,cause:Cause,detail:Details}' \
++    --output json
++  ASG_INSTANCES=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++    --query 'AutoScalingGroups[0].Instances[].InstanceId' --output text 2>/dev/null \
++    | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')
++fi
++
++if [ "$CI_COUNT" = "0" ]; then
++  if [ -n "$ASG_INSTANCES" ] && [ "$ASG_INSTANCES" != "None" ]; then
++    # shellcheck disable=SC2086
++    try ec2 describe-instances --instance-ids $ASG_INSTANCES \
++      --query 'Reservations[].Instances[].{id:InstanceId,state:State.Name,ami:ImageId,type:InstanceType,launched:LaunchTime,subnet:SubnetId,sgs:SecurityGroups[].GroupId,profile:IamInstanceProfile.Arn}' \
++      --output table
++    verdict "A2" "an instance exists ($ASG_INSTANCES) but never registered with '$CLUSTER'" \
++"Read the agent log on the box. No SSH ingress exists in this stack, so use SSM:
++  aws ssm start-session --target <i-...>
++  sudo tail -n 150 /var/log/ecs/ecs-agent.log
++  sudo cat /etc/ecs/ecs.config          # must contain ECS_CLUSTER=$CLUSTER
++Usual causes: the instance came from an older launch-template version (its user_data
++named a cluster that did not exist yet), AmazonEC2ContainerServiceforEC2Role missing
++from the instance profile, or the wrong region. To replace it instead of debugging it:
++  sh scripts/ecs-worker-repair.sh --yes   # terminate-and-relaunch through the ASG"
++  elif [ -n "$ASG" ] && [ "$ASG" != "None" ]; then
++    verdict "A1" "the worker ASG ('$ASG') has no instances - nothing to place tasks on" \
++"Read the scaling activities printed above first (a 2 vCPU quota with max_size=2 shows up
++as 'Your requested instance count exceeds...'). Then replace the worker through the ASG.
++Do NOT pick describe-instances Reservations[0].Instances[0] - that can terminate an
++unrelated machine in the account:
++  aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names '$ASG' \\
++    --query 'AutoScalingGroups[0].Instances[].InstanceId' --output text
++  aws autoscaling terminate-instance-in-auto-scaling-group \\
++    --auto-scaling-group-name '$ASG' --instance-id <i-...>   # desired stays 1, a replacement launches
++  aws ecs wait container-instances-healthy --cluster '$CLUSTER'
++If the group is at 0 and nothing is starting:
++  aws autoscaling set-desired-capacity --auto-scaling-group-name '$ASG' --desired-capacity 1
++Or let the repair script read the activities, repoint the launch template at a live AMI and
++ask for one instance (dry run first): sh scripts/ecs-worker-repair.sh [--yes]"
++  else
++    verdict "A1" "no worker ASG and no container instances - the EC2 half of the stack is missing" \
++"Do not apply over an empty state when the account already has the rest of the stack
++(README step 2 checks exactly that). Once the state is right, terraform apply, then:
++  aws autoscaling describe-auto-scaling-groups \\
++    --query 'AutoScalingGroups[].[AutoScalingGroupName,DesiredCapacity]' --output table"
++  fi
++fi
++
++# ─────────────────────────────────────────────────────────────────────────────
++for SVC in $SERVICES; do
++  SHORT=${SVC%-service}
++
++  hr "3. Service $SVC"
++  try ecs describe-services --cluster "$CLUSTER" --services "$SVC" \
++    --query 'services[0].{desired:desiredCount,running:runningCount,pending:pendingCount,taskdef:taskDefinition,minHealthy:deploymentMinimumHealthyPercent,deployments:deployments[].{status:status,desired:desiredCount,running:runningCount,rollout:rolloutState},events:events[0:4].[createdAt,message]}' \
++    --output json
++
++  RUNNING=$(q "$SVC" 'services[0].runningCount')
++  PENDING=$(q "$SVC" 'services[0].pendingCount')
++  EVENTS=$(q "$SVC" 'services[0].events[].message')
++  printf '\n  last events:\n'
++  printf '%s\n' "$EVENTS" | tr ']' '\n' | grep -v '^\s*$' | head -6 | sed 's/^/    - /'
++
++  STOPPED=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SVC" \
++    --desired-status STOPPED --query 'taskArns' --output text 2>/dev/null \
++    | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//')
++  STOP_REASONS=""
++  if [ -n "$STOPPED" ] && [ "$STOPPED" != "None" ]; then
++    hr "4. $SHORT: stopped tasks"
++    # shellcheck disable=SC2086
++    try ecs describe-tasks --cluster "$CLUSTER" --tasks $STOPPED \
++      --query 'tasks[].{stopped:stoppedReason,code:stopCode,startedBy:startedBy,containers:containers[].{name:name,reason:reason,exit:exitCode}}' \
++      --output json
++    # shellcheck disable=SC2086
++    STOP_REASONS=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks $STOPPED \
++      --query 'tasks[].stoppedReason + containers[].reason' --output text 2>/dev/null \
++      | tr '\n' ' ' | tr -s ' ')
++  fi
++
++  hr "5. $SHORT: ALB target health"
++  TG_STATE=""
++  TG_ARN=$(aws elbv2 describe-target-groups --names "ecommerce-$SHORT-tg" \
++    --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null | tr -d '\n')
++  if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
++    try elbv2 describe-target-health --target-group-arn "$TG_ARN" \
++      --query 'TargetHealthDescriptions[].{target:Target,health:TargetHealth}' --output table
++    TG_STATE=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
++      --query 'TargetHealthDescriptions[].TargetHealth.State' --output text 2>/dev/null | tr '\n' ' ')
++  else
++    echo "  target group ecommerce-$SHORT-tg not found - was terraform applied?"
++  fi
++
++  hr "6. $SHORT: container logs, last 15m"
++  printf '$ aws logs tail /ecs/%s --since 15m\n' "$SHORT"
++  aws logs tail "/ecs/$SHORT" --since 15m 2>&1 | tail -n 25 | sed 's/^/    /'
++
++  # ---- per-service classification -------------------------------------------
++  LOWER=$(printf '%s %s' "$STOP_REASONS" "$EVENTS" | tr 'A-Z' 'a-z')
++  case "$LOWER" in
++    *cannotpull*|*"unable to pull"*|*"repository does not exist"*|*"access denied"*)
++      verdict "B" "$SHORT: the image could not be pulled" \
++"Two causes, in order of likelihood:
++  1. the task execution role is missing the managed policy:
++       TD=\$(aws ecs describe-services --cluster $CLUSTER --services $SVC \\
++             --query 'services[0].taskDefinition' --output text)
++       ROLE=\$(aws ecs describe-task-definition --task-definition \"\$TD\" \\
++             --query 'taskDefinition.executionRoleArn' --output text)
++       aws iam list-attached-role-policies --role-name \"\$ROLE\" \\
++         --query 'AttachedPolicies[].PolicyArn' --output text  # want .../AmazonECSTaskExecutionRolePolicy
++     (this stack sets execution_role_arn = aws_iam_role.ecs_task.arn in ecs.tf, so a
++      missing policy usually means a hand-registered revision from before that fix)
++  2. the image tag is not in ECR:
++       aws ecr describe-images --repository-name ecommerce-$SHORT \\
++         --query 'sort_by(imageDetails,&imagePushedAt)[-3:].imageTags'
++     CI tags :<git-sha> and :latest; a lifecycle policy keeps only 10 images, so an
++     old sha tag can legitimately be gone - deploy :latest or a newer sha instead."
++      ;;
++    *oomkill*|*"exit code 137"*|*"exit code":137*)
++      verdict "E" "$SHORT: container killed with exit 137 (OOM)" \
++"The task's container memory is 256 MB (infrastructure/ecs.tf). Either raise it
++(memory 512 with task memory 1024) or trim the JVM: JAVA_OPTS=-XX:MaxRAMPercentage=75."
++      ;;
++    *"unable to place a task"*|*"no container instance"*|*"insufficient cpu"*|*"insufficient memory"*|*"capacity provider"*)
++      verdict "A3" "$SHORT: ECS refused to place the task (capacity, not your code)" \
++"Section 2 shows the registered instances and their remaining CPU/RAM. The task asks
++for 256 CPU units and 512 MB. With one t3.micro and both services deployed, the first
++task of each fits; a rolling deploy needs the old task stopped first, which is what
++deployment_minimum_healthy_percent = 0 is for - confirm it survived:
++  aws ecs describe-services --cluster $CLUSTER --services $SVC \\
++    --query 'services[0].deploymentMinimumHealthyPercent' --output text"
++      ;;
++  esac
++
++  if [ "${RUNNING:-0}" = "0" ] && [ "${PENDING:-0}" != "0" ]; then
++    echo "  note: pending=$PENDING with running=0 - ECS is still trying to place the task."
++  fi
++  if [ "${RUNNING:-0}" != "0" ] && printf '%s' "$TG_STATE" | grep -qiv healthy; then
++    verdict "C" "$SHORT: task is running but the ALB target is '$TG_STATE'" \
++"If it says 'initial', give the container 60-120s (Spring Boot + first DB connection).
++Otherwise the port is not answering from the ALB's point of view:
++  curl -sS -o /dev/null -w '%{http_code}\\n' http://<instance-private-ip>:8080/api/actuator/health
++  aws ec2 describe-security-groups --group-ids <ecs-instance-sg>   # must allow 80,8080 from the ALB SG
++The backend target group checks /actuator/health but the app serves it under /api, so a
++404 is expected and accepted (matcher 200,401,404 in infrastructure/alb.tf)."
++  fi
++done
++
++# ─────────────────────────────────────────────────────────────────────────────
++hr "Verdicts"
++if [ -s "$VERDICTS" ]; then
++  sed 's/^/  /' "$VERDICTS"
++else
++  cat <<'EOF'
++  No capacity, placement, image or target-health problem detected. If a service still
++  shows running=0, compare its deployments[] rolloutState with the events printed in
++  section 3 - a stuck REPLACEMENT deployment with the old PRIMARY still running means
++  deployment_minimum_healthy_percent is back to 100 (host networking + one instance
++  can never satisfy that).
++EOF
++fi
++
++printf '\n──────── next: after the worker registers, roll both services ────────\n'
++printf '  REGISTRY=%s.dkr.ecr.%s.amazonaws.com TAG=<git-sha> sh scripts/ecs-deploy-both.sh\n' \
++  "${AWS_ACCOUNT_ID:-414100287492}" "$AWS_DEFAULT_REGION"
+diff --git a/scripts/ecs-worker-repair.sh b/scripts/ecs-worker-repair.sh
+new file mode 100644
+index 0000000..82cce2e
+--- /dev/null
++++ b/scripts/ecs-worker-repair.sh
+@@ -0,0 +1,297 @@
++#!/bin/sh
++# ecs-worker-repair.sh - get a container instance registered again WITHOUT Terraform.
++#
++# For the case scripts/ecs-diagnose.sh calls verdict A1/A2: the cluster is ACTIVE but
++# `aws ecs list-container-instances` is empty, so both services sit at desired=1/running=0.
++# The two reasons that actually happen in this stack:
++#
++#   1. the worker launch template points at an AMI AWS has since retired - every
++#      "InvalidAMIID.NotFound" in the ASG's scaling activities means this. (The previous
++#      infrastructure/ecs.tf hardcoded ami-04fcaec208e9dd0f1, which is exactly the failure
++#      the current version avoids by reading the AL2023 id from SSM Parameter Store.)
++#   2. the ASG is at desired capacity 0, or holds instances that never registered because
++#      their user_data named a cluster that was later deleted and recreated.
++#
++# It fixes both by publishing a new launch-template version with a live AMI and asking the
++# ASG for one instance, then waiting for the agent to register. No Terraform state is read or
++# written, which is what makes it usable while the state is missing or stale; infrastructure/
++# ecs.tf uses name_prefix + ignore_changes = [image_id] on the launch template, so a later
++# `terraform plan` will not fight the new AMI version.
++#
++#   sh scripts/ecs-worker-repair.sh          # read-only: diagnosis + plan
++#   sh scripts/ecs-worker-repair.sh --yes    # execute it
++#
++# ECS_CLUSTER=... selects another cluster (default ecommerce-cluster).
++set -u
++
++CLUSTER="${ECS_CLUSTER:-ecommerce-cluster}"
++REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-us-east-1}}"
++ACT=0
++for ARG in "$@"; do
++  case "$ARG" in
++    --yes|-y|yes) ACT=1 ;;
++    --dry-run|--plan) ACT=0 ;;
++    *) echo "note: ignoring unknown argument '$ARG'" ;;
++  esac
++done
++
++FAILED=0
++say() { printf '\n──────── %s ────────\n' "$1"; }
++# q <args...> - read-only AWS call, tolerated
++q() {
++  out=$(AWS_PAGER="" aws "$@" 2>&1) || { printf '  (unavailable) %s\n' "$out" >&2; return 1; }
++  printf '%s\n' "$out"
++}
++# run <args...> - mutating AWS call: printed always, executed only with --yes
++run() {
++  printf '  $ aws %s\n' "$*"
++  [ "$ACT" = "1" ] || return 0
++  out=$(AWS_PAGER="" aws "$@" 2>&1) || { FAILED=1; printf '    FAILED: %s\n' "$out" >&2; return 1; }
++  [ -n "$out" ] && printf '    %s\n' "$out"
++  return 0
++}
++
++echo "════════════ ECS worker repair (cluster '$CLUSTER' in $REGION) ════════════"
++if [ "$ACT" = "1" ]; then
++  echo "mode: --yes - this WILL publish a launch template version and change ASG capacity"
++else
++  echo "mode: dry run - add --yes to execute"
++fi
++if [ "$REGION" != "us-east-1" ]; then
++  echo "note: the region is '$REGION'. SSM parameter values and AMI ids are region specific, so"
++  echo "      make sure this is where the stack was actually created (README uses us-east-1)."
++fi
++
++# ---------------------------------------------------------------- live AMI for this region
++say "choosing a current ECS-optimised AMI"
++AMI=""
++AMI_PARAM=""
++for PARAM in \
++  /aws/service/ecs/optimized-ami/al2023/kernel-5_10/recommended/image_id \
++  /aws/service/ecs/optimized-ami/al2023/recommended/image_id \
++  /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
++do
++  CAND=$(q ssm get-parameters --names "$PARAM" --query 'Parameters[0].Value' --output text) || continue
++  case "$CAND" in ami-*) ;; *) continue ;; esac
++  if q ec2 describe-images --image-ids "$CAND" --query 'Images[0].State' --output text >/dev/null 2>&1; then
++    AMI="$CAND"
++    AMI_PARAM="$PARAM"
++    echo "  using $AMI  (from $PARAM)"
++    break
++  fi
++done
++if [ -z "$AMI" ]; then
++  cat >&2 <<EOF
++  ERROR: no usable ECS-optimised AMI could be read from SSM Parameter Store.
++  Terraform reads the same parameter, so if this call is blocked your IAM user is missing
++  ssm:GetParameters / ec2:DescribeImages:
++    aws ssm get-parameters --region $REGION \\
++      --names /aws/service/ecs/optimized-ami/al2023/kernel-5_10/recommended/image_id \\
++      --query 'Parameters[0].Value' --output text
++EOF
++  exit 1
++fi
++
++# ------------------------------------------------------ find the ASG that serves our cluster
++say "scanning Auto Scaling groups for the one that joins '$CLUSTER'"
++FOUND=""
++FOUND_LT=""
++FOUND_LTVER=""
++FOUND_IMG=""
++FOUND_DES=""
++FOUND_MIN=""
++FOUND_IDS=""
++for ASG in $(q autoscaling describe-auto-scaling-groups \
++               --query 'AutoScalingGroups[].AutoScalingGroupName' --output text); do
++  LTID=$(q autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' --output text)
++  LTVER=$(q autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++             --query 'AutoScalingGroups[0].LaunchTemplate.Version' --output text)
++  MIN=$(q autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++           --query 'AutoScalingGroups[0].MinSize' --output text)
++  DES=$(q autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++           --query 'AutoScalingGroups[0].DesiredCapacity' --output text)
++  MAX=$(q autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++           --query 'AutoScalingGroups[0].MaxSize' --output text)
++  IDS=$(q autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
++           --query 'AutoScalingGroups[0].Instances[].InstanceId' --output text | tr '\n' ' ')
++  IMG=""
++  CL_OF_LT=""
++  case "${LTID:-}" in
++    lt-*)
++      IMG=$(q ec2 describe-launch-template-versions --launch-template-id "$LTID" --versions "$LTVER" \
++              --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' --output text)
++      UD=$(q ec2 describe-launch-template-versions --launch-template-id "$LTID" --versions "$LTVER" \
++              --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text)
++      CL_OF_LT=$(printf '%s' "${UD:-}" | base64 -d 2>/dev/null \
++                   | grep -o 'ECS_CLUSTER=[A-Za-z0-9_.-]*' | head -1 | cut -d= -f2)
++      ;;
++  esac
++  printf '  %s\n    min/desired/max=%s/%s/%s  instances=[%s]\n    LT=%s@%s  image=%s  cluster in user_data=%s\n' \
++    "$ASG" "${MIN:-?}" "${DES:-?}" "${MAX:-?}" "${IDS% }" "${LTID:-none}" "${LTVER:-?}" "${IMG:-?}" "${CL_OF_LT:-none}"
++
++  case "${CL_OF_LT:-}" in
++    "$CLUSTER")
++      FOUND="$ASG"
++      FOUND_LT="$LTID"
++      FOUND_LTVER="$LTVER"
++      FOUND_IMG="$IMG"
++      FOUND_DES="$DES"
++      FOUND_MIN="$MIN"
++      FOUND_IDS="$IDS"
++      ;;
++  esac
++done
++if [ -z "$FOUND" ]; then
++  cat >&2 <<EOF
++  ERROR: no Auto Scaling group in $REGION has a launch template whose user_data joins
++  '$CLUSTER', so there is no worker to repair: the capacity was never applied.
++
++  That is the real gap here, and it is why both services are at 0 running - ECS has nothing
++  to place tasks on. Either:
++    1. apply infrastructure/ with Terraform state that matches this account (README step 2), or
++    2. try another region:  AWS_DEFAULT_REGION=us-west-2 sh scripts/ecs-worker-repair.sh
++EOF
++  exit 1
++fi
++echo "  → repairing $FOUND"
++
++# --------------------------------------------------------- is the current image the problem?
++say "worker image health"
++IMAGE_IS_BAD=0
++if [ -n "${FOUND_IMG:-}" ]; then
++  case "$FOUND_IMG" in
++    ami-*)
++      if q ec2 describe-images --image-ids "$FOUND_IMG" --query 'Images[0].State' --output text >/dev/null 2>&1; then
++        echo "  current image $FOUND_IMG still resolves - the AMI is not the problem"
++      else
++        IMAGE_IS_BAD=1
++        echo "  BAD: the launch template references $FOUND_IMG, which no longer exists in $REGION,"
++        echo "       so every launch attempt fails before an instance is created."
++      fi
++      ;;
++    *) echo "  current image: '$FOUND_IMG' (could not read it - continuing)" ;;
++  esac
++fi
++say "recent ASG scaling activities (the real reason)"
++q autoscaling describe-scaling-activities --auto-scaling-group-name "$FOUND" --max-items 4 \
++  --query 'Activities[].[StatusCode,StatusMessage,Description]' --output text \
++  | sed 's/^/    /' || true
++
++# ------------------------------------------------------------------------ apply the repairs
++say "plan"
++if [ "$IMAGE_IS_BAD" = "1" ] || [ "${FOUND_IMG:-}" != "$AMI" ]; then
++  echo "  publish $AMI as a new version of $FOUND_LT (copies instance type, SGs, instance"
++  echo "  profile and user_data from the default version)"
++  run ec2 create-launch-template-version \
++    --launch-template-id "$FOUND_LT" --source-version '$Default' \
++    --version-description ecs-worker-repair-live-AMI \
++    --image-id "$AMI" || true
++  if [ "$ACT" = "1" ]; then
++    NEWVER=$(q ec2 describe-launch-template-versions --launch-template-id "$FOUND_LT" \
++               --versions '$Latest' --query 'LaunchTemplateVersions[0].VersionNumber' --output text) || NEWVER=""
++    case "${NEWVER:-}" in
++      ''|*[!0-9]*) echo "  (could not read the new version number; leaving the default version alone)" ;;
++      *) run ec2 modify-launch-template --launch-template-id "$FOUND_LT" --default-version "$NEWVER" ;;
++    esac
++  fi
++  case "${FOUND_LTVER:-}" in
++    *Latest*)
++      echo "  the ASG follows \$Latest, so its next launch uses the new AMI by itself"
++      ;;
++    *)
++      echo "  the ASG pins version ${FOUND_LTVER:-?} - repoint it at \$Latest"
++      run autoscaling update-auto-scaling-group --auto-scaling-group-name "$FOUND" \
++        --launch-template "LaunchTemplateId=$FOUND_LT,Version=\$Latest" || true
++      ;;
++  esac
++else
++  echo "  image already matches the live AMI - no launch template change needed"
++fi
++
++FOUND_IDS_COMPACT=$(printf '%s' "${FOUND_IDS:-}" | tr -d ' \t\n')
++if [ -n "$FOUND_IDS_COMPACT" ]; then
++  echo "  the ASG has instances but ECS lists none registered -> replace them (a fresh"
++  echo "  instance re-reads user_data and re-joins the cluster)"
++  for IID in $FOUND_IDS; do
++    run autoscaling terminate-instance-in-auto-scaling-group \
++      --auto-scaling-group-name "$FOUND" --instance-id "$IID" \
++      --should-decrement-desired-capacity || true
++  done
++  TARGET=1
++  case "${FOUND_MIN:-}" in ''|*[!0-9]*) : ;; *) [ "$FOUND_MIN" -ge 1 ] && TARGET="$FOUND_MIN" ;; esac
++  echo "  then ask for the capacity back"
++  run autoscaling set-desired-capacity --auto-scaling-group-name "$FOUND" --desired-capacity "$TARGET" || true
++else
++  TARGET=1
++  case "${FOUND_MIN:-}" in ''|*[!0-9]*) : ;; *) [ "$FOUND_MIN" -ge 1 ] && TARGET="$FOUND_MIN" ;; esac
++  if [ "${FOUND_DES:-0}" = "0" ]; then
++    echo "  ASG is scaled to 0 - asking for $TARGET instance"
++  else
++    echo "  ASG has no instances at desired ${FOUND_DES:-?} - forcing a new launch"
++  fi
++  run autoscaling set-desired-capacity --auto-scaling-group-name "$FOUND" --desired-capacity "$TARGET" || true
++fi
++
++if [ "$FAILED" = "1" ]; then
++  echo
++  echo "Some calls failed - fix the error above and re-run." >&2
++  exit 1
++fi
++if [ "$ACT" != "1" ]; then
++  cat <<EOF
++
++Dry run only. Re-run with --yes to publish the new launch template version and change the
++ASG's capacity. A t3.micro is 2 vCPU, which is exactly the quota on this account, so keep
++min/desired at 1 until the quota is raised (or move to t3.small + quota 4).
++EOF
++  exit 0
++fi
++
++# ------------------------------------------------------------------- wait for registration
++WAIT_SEC=${ECS_REGISTER_TIMEOUT:-480}
++say "waiting up to $(( ( WAIT_SEC + 59 ) / 60 )) min for the agent to register (ASG launch + cloud-init)"
++I=0
++INST=""
++# ECS_REGISTER_TIMEOUT seconds, 15s per poll (default 8 min: ASG launch + cloud-init)
++DEADLINE=$(( $(date +%s) + ${ECS_REGISTER_TIMEOUT:-480} ))
++while [ "$(date +%s)" -lt "$DEADLINE" ]; do
++  INST=$(q ecs list-container-instances --cluster "$CLUSTER" \
++           --query 'containerInstanceArns[0]' --output text) || INST=""
++  case "${INST:-}" in arn:*) break ;; esac
++  sleep 15
++done
++case "${INST:-}" in
++  arn:*) ;;
++  *)
++    cat >&2 <<EOF
++  Still no registered container instance. These two calls say where it stopped:
++    aws autoscaling describe-scaling-activities --auto-scaling-group-name $FOUND \\
++      --max-items 3 --query 'Activities[].[StatusCode,StatusMessage]' --output text   # quota/AMI/SG
++    aws ec2 describe-instance-status --include-all-instances \\
++      --filters "Name=tag:aws:autoscaling:groupName,Values=$FOUND" \\
++      --query 'InstanceStatuses[].[InstanceId,InstanceState.Name]' --output text
++  If the instance is running but never registers, read the agent log over SSM (this stack has
++  no SSH ingress):
++    aws ssm start-session --target <i-...>
++    sudo tail -n 150 /var/log/ecs/ecs-agent.log
++    sudo cat /etc/ecs/ecs.config        # must say ECS_CLUSTER=$CLUSTER
++EOF
++    exit 1
++    ;;
++esac
++echo "  registered: $INST"
++q ecs describe-container-instances --cluster "$CLUSTER" --container-instances "$INST" \
++  --query 'containerInstances[0].{Agent:agentVersion,EC2:ec2InstanceId,Status:status,Remaining:remainingResources}' \
++  | sed 's/^/    /' || true
++
++say "next"
++cat <<EOF
++  Capacity is back. Roll both services onto the image that is already in ECR:
++    sh scripts/ecs-deploy-both.sh
++  then confirm placement and target health:
++    sh scripts/ecs-diagnose.sh
++  infrastructure/ecs.tf keeps the AMI current on its own (data.aws_ssm_parameter.ecs_ami with
++  create_before_destroy), so once your Terraform state matches this account this repair
++  should not be needed again.
++EOF
