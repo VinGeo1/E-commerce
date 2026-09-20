@@ -8,109 +8,111 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write
   contents: read
+
+env:
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  ECR_REGISTRY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_DEFAULT_REGION }}.amazonaws.com
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: us-east-1
-          role-to-assume: arn:aws:iam::414100287492:role/GitHubActionsRole
-
-      - name: Validate required variables
+      - name: Validate required config
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           if [ -z "$AWS_ACCESS_KEY_ID" ]; then echo "MISSING: AWS_ACCESS_KEY_ID"; exit 1; fi
           if [ -z "$AWS_SECRET_ACCESS_KEY" ]; then echo "MISSING: AWS_SECRET_ACCESS_KEY"; exit 1; fi
           if [ -z "$AWS_DEFAULT_REGION" ]; then echo "MISSING: AWS_DEFAULT_REGION"; exit 1; fi
           if [ -z "$AWS_ACCOUNT_ID" ]; then echo "MISSING: AWS_ACCOUNT_ID"; exit 1; fi
-          if [ -z "$ALB_DNS" ]; then echo "MISSING: ALB_DNS"; exit 1; fi
-          echo "All required CI variables present."
+          echo "All required config present."
 
   build-and-push-backend:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: us-east-1
-          role-to-assume: arn:aws:iam::414100287492:role/GitHubActionsRole
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push backend Docker image
+      - name: Build and push backend image
         uses: docker/build-push-action@v5
         with:
           context: ./backend
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/ecommerce-backend:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/ecommerce-backend:latest
+            ${{ env.ECR_REGISTRY }}/ecommerce-backend:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/ecommerce-backend:latest
 
   build-and-push-frontend:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: us-east-1
-          role-to-assume: arn:aws:iam::414100287492:role/GitHubActionsRole
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push frontend Docker image
+      - name: Build and push frontend image
         uses: docker/build-push-action@v5
         with:
           context: ./frontend
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/ecommerce-frontend:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/ecommerce-frontend:latest
+            ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/ecommerce-frontend:latest
 
   deploy-backend:
     needs: [build-and-push-backend]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: us-east-1
-          role-to-assume: arn:aws:iam::414100287492:role/GitHubActionsRole
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
       - name: Deploy backend service
         env:
           ECS_CLUSTER: ecommerce-cluster
           ECS_SERVICE: backend-service
-          IMAGE: ${{ steps.login-ecr.outputs.registry }}/ecommerce-backend:${{ github.sha }}
+          IMAGE: ${{ env.ECR_REGISTRY }}/ecommerce-backend:${{ github.sha }}
         run: |
+          set -e
           if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
           if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
           echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
           TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
-          if [ -z "$TASK_DEF_ARN" ]; then echo "ERROR: empty task def ARN"; exit 1; fi
-          if [ "$TASK_DEF_ARN" = "None" ]; then echo "ERROR: service $ECS_SERVICE not found — run terraform apply first"; exit 1; fi
+          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
+            echo "ERROR: service $ECS_SERVICE not found in $ECS_CLUSTER"
+            exit 1
+          fi
           echo "Current task def: $TASK_DEF_ARN"
           aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
           jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
@@ -124,27 +126,30 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: us-east-1
-          role-to-assume: arn:aws:iam::414100287492:role/GitHubActionsRole
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
       - name: Deploy frontend service
         env:
           ECS_CLUSTER: ecommerce-cluster
           ECS_SERVICE: frontend-service
-          IMAGE: ${{ steps.login-ecr.outputs.registry }}/ecommerce-frontend:${{ github.sha }}
+          IMAGE: ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
         run: |
+          set -e
           if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
           if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
           echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
           TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
-          if [ -z "$TASK_DEF_ARN" ]; then echo "ERROR: empty task def ARN"; exit 1; fi
-          if [ "$TASK_DEF_ARN" = "None" ]; then echo "ERROR: service $ECS_SERVICE not found — run terraform apply first"; exit 1; fi
+          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
+            echo "ERROR: service $ECS_SERVICE not found in $ECS_CLUSTER"
+            exit 1
+          fi
           echo "Current task def: $TASK_DEF_ARN"
           aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
           jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
