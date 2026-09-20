@@ -10,12 +10,16 @@ on:
 permissions:
   contents: read
 
+env:
+  AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  ECR_REGISTRY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_DEFAULT_REGION }}.amazonaws.com
+
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -24,7 +28,7 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-      - name: Validate required variables
+      - name: Validate required config
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -39,8 +43,7 @@ jobs:
     outputs:
       registry: ${{ steps.login-ecr.outputs.registry }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -53,7 +56,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push backend Docker image
+      - name: Build and push backend image
         uses: docker/build-push-action@v5
         with:
           context: ./backend
@@ -68,8 +71,7 @@ jobs:
     outputs:
       registry: ${{ steps.login-ecr.outputs.registry }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -82,7 +84,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push frontend Docker image
+      - name: Build and push frontend image
         uses: docker/build-push-action@v5
         with:
           context: ./frontend
@@ -96,8 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -112,6 +113,7 @@ jobs:
           ECS_SERVICE: backend-service
           IMAGE: ${{ needs.build-and-push-backend.outputs.registry }}/ecommerce-backend:${{ github.sha }}
         run: |
+          set -e
           if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
           if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
           echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
@@ -134,8 +136,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -150,6 +151,7 @@ jobs:
           ECS_SERVICE: frontend-service
           IMAGE: ${{ needs.build-and-push-frontend.outputs.registry }}/ecommerce-frontend:${{ github.sha }}
         run: |
+          set -e
           if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
           if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
           echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
