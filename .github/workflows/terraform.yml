@@ -1,0 +1,63 @@
+name: Terraform
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform action to run'
+        required: true
+        default: 'plan'
+        options:
+          - plan
+          - apply
+          - destroy
+      db_password:
+        description: 'Database password (required for apply)'
+        required: false
+        type: string
+      confirmation:
+        description: 'Type "DESTROY" to confirm destruction'
+        required: false
+        type: string
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    if: |
+      github.event.inputs.action != 'destroy' ||
+      (github.event.inputs.action == 'destroy' && github.event.inputs.confirmation == 'DESTROY')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::414100287492:role/GitHubActionsRole
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Terraform Init
+        run: terraform -chdir=infrastructure init -input=false
+
+      - name: Terraform Format
+        run: terraform -chdir=infrastructure fmt -check
+
+      - name: Terraform Validate
+        run: terraform -chdir=infrastructure validate
+
+      - name: Terraform Plan
+        if: github.event.inputs.action == 'plan'
+        run: terraform -chdir=infrastructure plan -input=false -var="db_password=${{ github.event.inputs.db_password }}"
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply'
+        run: terraform -chdir=infrastructure apply -input=false -auto-approve -var="db_password=${{ github.event.inputs.db_password }}"
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        run: terraform -chdir=infrastructure destroy -input=false -auto-approve
