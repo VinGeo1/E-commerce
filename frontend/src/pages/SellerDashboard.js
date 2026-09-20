@@ -5,15 +5,30 @@ export default function SellerDashboard() {
   const [products, setProducts] = useState([]);
   const [newProduct, setNewProduct] = useState({ name: '', price: 0 });
 
-  useEffect(() => { api.get('/products').then(res => setProducts(res.data)); }, []);
+  useEffect(() => {
+    api.get('/products')
+      .then(res => setProducts(res.data))
+      .catch(err => console.error(err));
+  }, []);
 
   const handleAdd = async () => {
-    await api.post('/products', newProduct);
-    setProducts([...products, newProduct]);
+    try {
+      const res = await api.post('/products', newProduct);
+      setProducts([...products, res.data]);
+    } catch (err) {
+      console.error(err);
+    }
   };
 
   const handlePriceUpdate = async (id, price) => {
-    await api.put(`/products/${id}/price`, price);
+    try {
+      const res = await api.put(`/products/${id}/price`, price, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+      setProducts(products.map(p => (p.id === id ? res.data : p)));
+    } catch (err) {
+      console.error(err);
+    }
   };
 
   return (
