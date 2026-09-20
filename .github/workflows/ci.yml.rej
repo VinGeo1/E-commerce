@@ -1,0 +1,128 @@
+--- .github/workflows/ci.yml
++++ .github/workflows/ci.yml
+@@ -89,78 +85,73 @@ jobs:
+             ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
+             ${{ env.ECR_REGISTRY }}/ecommerce-frontend:latest
+ 
++  # The two deploy jobs intentionally share scripts/ecs-deploy.sh: it rebuilds the
++  # register payload from the arguments RegisterTaskDefinition accepts instead of
++  # deleting a fixed list of read-only fields, and it fails with a check annotation
++  # that says *why* (missing service, inactive cluster, IAM, ...).
++  # WAIT_FOR_STABLE makes "green pipeline, 0 running tasks" impossible: the job only
++  # passes once the service reports steady state, and a failed rollout is followed by
++  # scripts/ecs-diagnose.sh (read-only) printing capacity / stopped-task / target health.
+   deploy-backend:
+-    needs: [build-and-push-backend]
++    needs: build-and-push-backend
+     runs-on: ubuntu-latest
+-    if: github.ref == 'refs/heads/main'
++    timeout-minutes: 25
++    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+     steps:
+       - uses: actions/checkout@v4
+ 
+-      - name: Configure AWS credentials
+-        uses: aws-actions/configure-aws-credentials@v4
++      - uses: aws-actions/configure-aws-credentials@v4
+         with:
+-          aws-region: us-east-1
+           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+ 
+-      - name: Deploy backend service
++      - name: Update ECS service
+         env:
+-          ECS_CLUSTER: ecommerce-cluster
+           ECS_SERVICE: backend-service
+-          IMAGE: ${{ needs.build-and-push-backend.outputs.registry }}/ecommerce-backend:${{ github.sha }}
+-        run: |
+-          set -e
+-          if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
+-          if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
+-          echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
+-          TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text 2>/dev/null || true)
+-          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
+-            echo "ERROR: Service '$ECS_SERVICE' or cluster '$ECS_CLUSTER' not found in AWS ECS."
+-            echo "Please run the Terraform workflow (apply action) first to provision the infrastructure."
+-            exit 1
+-          fi
+-          echo "Current task def: $TASK_DEF_ARN"
+-          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
+-          jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
+-          NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+-          echo "New task def: $NEW_ARN"
+-          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
+-          echo "Rollout triggered for $ECS_SERVICE"
++          CONTAINER_NAME: backend
++          IMAGE: ${{ env.ECR_REGISTRY }}/ecommerce-backend:${{ github.sha }}
++          # Fail the job unless the task actually reaches steady state: "registered a
++          # new revision" is not the same as "the service is running it".
++          WAIT_FOR_STABLE: 1
++        run: sh scripts/ecs-deploy.sh
++
++      # Only on failure, and only reads: prints cluster capacity, stopped-task
++      # reasons and ALB target health so the log says *why* nothing is running.
++      - name: Triage (read-only)
++        if: failure()
++        env:
++          ECS_CLUSTER: ecommerce-cluster
++        run: sh scripts/ecs-diagnose.sh backend-service
+ 
+   deploy-frontend:
+-    needs: [build-and-push-frontend]
++    needs: build-and-push-frontend
+     runs-on: ubuntu-latest
+-    if: github.ref == 'refs/heads/main'
++    timeout-minutes: 25
++    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+     steps:
+       - uses: actions/checkout@v4
+ 
+-      - name: Configure AWS credentials
+-        uses: aws-actions/configure-aws-credentials@v4
++      - uses: aws-actions/configure-aws-credentials@v4
+         with:
+-          aws-region: us-east-1
+           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
++          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+ 
+-      - name: Deploy frontend service
++      - name: Update ECS service
+         env:
+-          ECS_CLUSTER: ecommerce-cluster
+           ECS_SERVICE: frontend-service
+-          IMAGE: ${{ needs.build-and-push-frontend.outputs.registry }}/ecommerce-frontend:${{ github.sha }}
+-        run: |
+-          set -e
+-          if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
+-          if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
+-          echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
+-          TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text 2>/dev/null || true)
+-          if [ -z "$TASK_DEF_ARN" ] || [ "$TASK_DEF_ARN" = "None" ]; then
+-            echo "ERROR: Service '$ECS_SERVICE' or cluster '$ECS_CLUSTER' not found in AWS ECS."
+-            echo "Please run the Terraform workflow (apply action) first to provision the infrastructure."
+-            exit 1
+-          fi
+-          echo "Current task def: $TASK_DEF_ARN"
+-          aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
+-          jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
+-          NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
+-          echo "New task def: $NEW_ARN"
+-          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
+-          echo "Rollout triggered for $ECS_SERVICE"
++          CONTAINER_NAME: frontend
++          IMAGE: ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
++          # Fail the job unless the task actually reaches steady state: "registered a
++          # new revision" is not the same as "the service is running it".
++          WAIT_FOR_STABLE: 1
++        run: sh scripts/ecs-deploy.sh
++
++      # Only on failure, and only reads: prints cluster capacity, stopped-task
++      # reasons and ALB target health so the log says *why* nothing is running.
++      - name: Triage (read-only)
++        if: failure()
++        env:
++          ECS_CLUSTER: ecommerce-cluster
++        run: sh scripts/ecs-diagnose.sh frontend-service

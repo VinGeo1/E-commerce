@@ -73,20 +73,7 @@ build-frontend:
   before_script:
     - command -v jq >/dev/null 2>&1 || yum install -y jq >/dev/null 2>&1
   script:
-    - |
-      if [ -z "$ECS_SERVICE" ]; then echo "MISSING: ECS_SERVICE"; exit 1; fi
-      if [ -z "$IMAGE" ]; then echo "MISSING: IMAGE"; exit 1; fi
-      echo "Looking up task definition for $ECS_SERVICE in $ECS_CLUSTER..."
-      TASK_DEF_ARN=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --query 'services[0].taskDefinition' --output text)
-      if [ -z "$TASK_DEF_ARN" ]; then echo "ERROR: empty task def ARN"; exit 1; fi
-      if [ "$TASK_DEF_ARN" = "None" ]; then echo "ERROR: service $ECS_SERVICE not found — run terraform apply first"; exit 1; fi
-      echo "Current task def: $TASK_DEF_ARN"
-      aws ecs describe-task-definition --task-definition "$TASK_DEF_ARN" --query 'taskDefinition' --output json > /tmp/td.json
-      jq --arg IMG "$IMAGE" '.containerDefinitions[0].image = $IMG | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' /tmp/td.json > /tmp/td-new.json
-      NEW_ARN=$(aws ecs register-task-definition --cli-input-json file:///tmp/td-new.json --query 'taskDefinition.taskDefinitionArn' --output text)
-      echo "New task def: $NEW_ARN"
-      aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$NEW_ARN" --force-new-deployment > /dev/null
-      echo "Rollout triggered for $ECS_SERVICE"
+    - sh scripts/ecs-deploy.sh
 
 deploy-backend:
   extends: .ecs-deploy

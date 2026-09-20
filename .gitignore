@@ -1,23 +1,12 @@
-# Terraform
-infrastructure/*.tfstate
-infrastructure/*.tfstate.backup
+.env
+.env.*
+*.pem
+*.key
+node_modules/
+backend/target/
+frontend/build/
+infrastructure/terraform.tfstate*
 infrastructure/.terraform/
 infrastructure/*.tfplan
 infrastructure/terraform.tfvars
-
-# Environment variables
-.env
-.env.*
-
-# Node.js
-node_modules/
-
-# Java
-backend/target/
-
-# React
-frontend/build/
-
-# Certificates
-*.pem
-*.key
+.DS_Store
