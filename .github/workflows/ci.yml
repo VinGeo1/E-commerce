@@ -62,8 +62,8 @@ jobs:
           context: ./backend
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/ecommerce-backend:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/ecommerce-backend:latest
+            ${{ env.ECR_REGISTRY }}/ecommerce-backend:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/ecommerce-backend:latest
 
   build-and-push-frontend:
     needs: validate
@@ -90,8 +90,8 @@ jobs:
           context: ./frontend
           push: true
           tags: |
-            ${{ steps.login-ecr.outputs.registry }}/ecommerce-frontend:${{ github.sha }}
-            ${{ steps.login-ecr.outputs.registry }}/ecommerce-frontend:latest
+            ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/ecommerce-frontend:latest
 
   deploy-backend:
     needs: [build-and-push-backend]
