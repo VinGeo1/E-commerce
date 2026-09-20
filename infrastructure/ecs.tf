@@ -109,6 +109,11 @@ resource "aws_ecs_task_definition" "backend" {
     cpu       = 256
     memory    = 256
     essential = true
+    portMappings = [{
+      containerPort = 8080
+      hostPort      = 8080
+      protocol      = "tcp"
+    }]
     logConfiguration = {
       logDriver = "awslogs"
       options = {
@@ -144,6 +149,11 @@ resource "aws_ecs_task_definition" "frontend" {
     cpu       = 256
     memory    = 256
     essential = true
+    portMappings = [{
+      containerPort = 80
+      hostPort      = 80
+      protocol      = "tcp"
+    }]
     logConfiguration = {
       logDriver = "awslogs"
       options = {
