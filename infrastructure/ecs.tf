@@ -122,16 +122,25 @@ resource "aws_launch_template" "ecs" {
     http_endpoint = "enabled"
   }
 
+  # The ECS-optimized AMI ships the agent installed and enabled, and its unit is
+  # ordered After=cloud-final.service - systemd starts it only AFTER this user-data
+  # script has exited. So the config written below is what the agent reads on its
+  # first start, and the instance joins $ECS_CLUSTER a few minutes after boot.
+  #
+  # Do NOT add `systemctl start/restart ecs` here: while this script runs,
+  # cloud-final is active, so a blocking start would wait for cloud-final, which
+  # waits for the command to return - the script hangs (the boot's final step
+  # never completes) and the agent never starts, i.e. the instance never joins
+  # the cluster.
   user_data = base64encode(<<-EOT
     #!/bin/bash
     set -euxo pipefail
     cat > /etc/ecs/ecs.config <<'CONF'
     ECS_CLUSTER=ecommerce-cluster
-    ECS_ENABLE_CONTAINER_METADATA=true
-    ECS_LOGLEVEL=info
     CONF
-    systemctl enable ecs
-    systemctl start ecs
+    # Non-blocking: make sure the agent unit will start at boot (it already is
+    # on the optimized AMI; this covers an AMI revision that does not).
+    systemctl enable ecs 2>/dev/null || systemctl enable amazon-ecs-agent 2>/dev/null || true
   EOT
   )
 }
@@ -152,6 +161,13 @@ resource "aws_autoscaling_group" "ecs" {
   # networking means the new task cannot bind :8080 until the old one stops.
   health_check_type         = "EC2"
   health_check_grace_period = 300
+
+  # The workers have no public IP: they reach the ECS API, ECR and CloudWatch
+  # Logs only through the NAT. Without this ordering the ASG could launch an
+  # instance before the private routes exist; the agent would boot with no
+  # egress and sit unregistered (it retries, but this avoids the "instance is
+  # running, cluster is empty" window).
+  depends_on = [aws_nat_gateway.nat, aws_route_table_association.private]
 
   launch_template {
     id      = aws_launch_template.ecs.id
@@ -284,6 +300,15 @@ resource "aws_ecs_service" "backend" {
     container_port   = 8080
   }
 
+  # scripts/ecs-deploy.sh (CI) owns which task-definition revision is running.
+  # Without this, every unrelated `terraform apply` would detect the service's
+  # task_definition drifted from the revision Terraform registered and roll it
+  # back - on this single-worker, stop-then-start setup that is an avoidable
+  # outage. Terraform still updates everything else about the service.
+  lifecycle {
+    ignore_changes = [task_definition]
+  }
+
   depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.ec2_ecs_service]
 }
 
@@ -304,6 +329,10 @@ resource "aws_ecs_service" "frontend" {
     target_group_arn = aws_lb_target_group.frontend.arn
     container_name   = "frontend"
     container_port   = 80
+  }
+
+  lifecycle {
+    ignore_changes = [task_definition]
   }
 
   depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.ec2_ecs_service]

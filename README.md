@@ -29,7 +29,9 @@ against one shared S3 state file.
 `network_mode = "host"`: containers use the instance's ports directly, so `80`/`8080` are the
 only ports the ALB security group needs to reach. The two ECS services are allowed to stop the old
 task before starting the new one (`deployment_minimum_healthy_percent = 0`) because a second task
-on the same instance could never bind the same host port.
+on the same instance could never bind the same host port. CI owns which task-definition revision a
+service runs (see `lifecycle { ignore_changes = [task_definition] }` in `ecs.tf`), so an unrelated
+`terraform apply` never rolls a service back to the `:latest` revision.
 
 ## Tech stack
 
@@ -295,9 +297,9 @@ Destroying removes the cluster too, so the next CI deploy fails with
 | Deploy "succeeds" but `runningCount` is 0 | no capacity / image pull / port not answering | `sh scripts/ecs-diagnose.sh` (read-only) - see below |
 | `list-container-instances` is empty, ASG activity says `InvalidAMIID.NotFound` | the worker launch template points at a retired AMI, or the ASG is scaled to 0 | `sh scripts/ecs-worker-repair.sh` then the same with `--yes` |
 | `502 Bad Gateway` from the ALB | task not running, or the SG does not allow the ALB → instance on 80/8080 | `aws ecs describe-services --cluster ecommerce-cluster --services backend-service`; check `aws ecs describe-tasks` `stoppedReason` |
-| `503 Service Unavailable` | target registered but unhealthy | health-check path/`matcher` in `alb.tf`; backend answers 404 on `/actuator/health` (context path `/api`) which is accepted |
+| `503 Service Unavailable` | target registered but unhealthy | the backend health check hits `/api/actuator/health` and requires `200`; the actuator report includes the DB, so check app and RDS health in the `/ecs/backend` log group |
 | Timeouts on first requests | Spring Boot cold start + RDS connection | raise `unhealthy_threshold`/`interval` on the backend target group, or warm up before testing |
-| No targets registered at all | ECS agent never joined the cluster | wait 3-4 min after apply, then `aws ecs list-container-instances`; check the instance's `/var/log/ecs/ecs-agent.log` (SSM Session Manager → `mysql`-free AL2023 host) |
+| No targets registered at all | ECS agent never joined the cluster | wait 3-4 min after apply, then `aws ecs list-container-instances`; SSM Session Manager → `tail /var/log/ecs/ecs-agent.log`, `cat /etc/ecs/ecs.config`. The launch template's user_data must only *write* `ecs.config` - a `systemctl start ecs` in there blocks the boot (the agent unit is ordered `After=cloud-final.service`) and the agent never starts |
 | Deploy fails: `Unknown parameter in input: "deregisteredAt"` | task definition JSON from `describe-task-definition` replayed verbatim | already handled — `scripts/ecs-deploy.sh` rebuilds the payload from the accepted arguments and logs what it drops |
 | Deploy fails: `The referenced cluster was inactive` | the stack was destroyed | `terraform apply` again (Actions → Terraform), then re-run CI |
 | Deploy fails: `Capacity providers ... no container instances` / task stuck in `PENDING` | ASG instance still booting, or the 2-vCPU quota already used by a second instance | `aws autoscaling describe-auto-scaling-groups`; check `STOPPED_REASON` of the failed task |
