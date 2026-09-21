@@ -10,3 +10,7 @@ infrastructure/.terraform/
 infrastructure/*.tfplan
 infrastructure/terraform.tfvars
 .DS_Store
+
+# leftovers from `patch`/`git apply --reject`
+*.orig
+*.rej

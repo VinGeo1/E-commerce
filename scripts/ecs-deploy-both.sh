@@ -51,6 +51,7 @@ if [ -n "$FAILED" ]; then
   echo
   echo "Deploy did not converge for:$FAILED" >&2
   echo "Running read-only triage (cluster capacity / stopped tasks / target health):" >&2
+  # shellcheck disable=SC2086  # $FAILED is a space-separated list of service names
   ECS_CLUSTER="$CLUSTER" sh "$HERE/ecs-diagnose.sh" $FAILED || true
   exit 1
 fi

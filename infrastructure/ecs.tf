@@ -175,6 +175,14 @@ resource "aws_autoscaling_group" "ecs" {
 # network_mode = "host" (no ENI per task on EC2) and explicit portMappings, so a
 # container's port is also the instance's port. That is why each service below is
 # allowed to stop the old task before starting the new one.
+#
+# Sizing: both tasks have to fit on ONE t3.micro, which registers ~957 MiB with ECS
+# (1 GiB minus what the kernel keeps). The task-level `memory` is what the scheduler
+# reserves at placement, so two tasks at 512 MiB each (1024 MiB) can never both be
+# placed - the second service sits at running=0 with "insufficient memory available".
+# 512 (JVM) + 128 (nginx) = 640 MiB leaves ~300 MiB for the ECS agent, dockerd and
+# the OS. The container `memory` is the cgroup hard limit; the backend gets the whole
+# reservation because a Spring Boot 3 JVM in 256 MiB is OOM-killed (exit 137).
 
 resource "aws_ecs_task_definition" "backend" {
   family                   = "backend"
@@ -188,7 +196,7 @@ resource "aws_ecs_task_definition" "backend" {
     name      = "backend"
     image     = var.backend_image
     cpu       = 256
-    memory    = 256
+    memory    = 512
     essential = true
 
     portMappings = [{
@@ -222,13 +230,13 @@ resource "aws_ecs_task_definition" "frontend" {
   requires_compatibilities = ["EC2"]
   execution_role_arn       = aws_iam_role.ecs_task.arn
   cpu                      = "256"
-  memory                   = "512"
+  memory                   = "128"
 
   container_definitions = jsonencode([{
     name      = "frontend"
     image     = var.frontend_image
     cpu       = 256
-    memory    = 256
+    memory    = 128
     essential = true
 
     portMappings = [{
@@ -264,6 +272,12 @@ resource "aws_ecs_service" "backend" {
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
 
+  # Spring Boot on a t3.micro takes 60-90 s before :8080 answers, and the target
+  # group then needs healthy_threshold x interval (60 s) to flip to healthy. With
+  # the default grace period of 0 ECS would stop a cold-starting task as "failed
+  # ELB health checks" and loop forever.
+  health_check_grace_period_seconds = 180
+
   load_balancer {
     target_group_arn = aws_lb_target_group.backend.arn
     container_name   = "backend"
@@ -282,6 +296,9 @@ resource "aws_ecs_service" "frontend" {
 
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
+
+  # nginx is up in under a second; this only covers the target group's 2 x 30 s.
+  health_check_grace_period_seconds = 90
 
   load_balancer {
     target_group_arn = aws_lb_target_group.frontend.arn

@@ -97,7 +97,7 @@ aws dynamodb create-table --table-name ecommerce-tfstate-lock \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST --region us-east-1
 
-aws dynamodb describe-table --table-name ecommerce-tfstate-lock --query 'Table.TableStatus' --output text   # ACTIVEaws dynamodb describe-table --table-name ecommerce-tfstate-lock --query 'Table.TableStatus' --output text   # ACTIVE
+aws dynamodb describe-table --table-name ecommerce-tfstate-lock --query 'Table.TableStatus' --output text   # ACTIVE
 ```
 
 
@@ -330,7 +330,7 @@ health and the last 15 minutes of container logs - then prints a verdict:
 | `A3` | "unable to place a task ... insufficient CPU/memory" | compare task CPU/RAM with `remainingResources`; check `deploymentMinimumHealthyPercent` |
 | `B`  | `CannotPullContainerError` / access denied | task execution role policy, or the tag is gone from ECR (lifecycle keeps 10 images) |
 | `C`  | task running, target unhealthy | 60-120s cold start, then SG/path check (backend health is `/api/actuator/health`) |
-| `E`  | exit 137 / OOM | container memory is 256 MB in `ecs.tf` |
+| `E`  | exit 137 / OOM | the backend container's hard limit is 512 MiB in `ecs.tf` (JVM heap capped at 50% via `JAVA_TOOL_OPTIONS` in `backend/Dockerfile`) |
 
 For verdicts `A1`/`A2` - no registered worker - there is a repair path that does not need
 Terraform state at all. It is dry-run first, and it only ever touches the ASG whose launch
