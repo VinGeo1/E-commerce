@@ -89,46 +89,72 @@ jobs:
             ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
             ${{ env.ECR_REGISTRY }}/ecommerce-frontend:latest
 
+  # The two deploy jobs share scripts/ecs-deploy.sh: it copies the service's current
+  # task definition, swaps the image on the named container, registers a new revision
+  # built from only the arguments RegisterTaskDefinition accepts, and fails with a
+  # check annotation that says *why* (missing service, inactive cluster, IAM, ...).
+  #
+  # IMAGE is built from the workflow-level ECR_REGISTRY (the build jobs expose no
+  # outputs; the previous `needs.<job>.outputs.registry` expanded to "" and produced
+  # "/ecommerce-backend:<sha>"). ECS_CLUSTER also comes from the workflow env.
+  #
+  # WAIT_FOR_STABLE makes "green pipeline, 0 running tasks" impossible: the job only
+  # passes once the service reports steady state, and a failed rollout is followed by
+  # scripts/ecs-diagnose.sh (read-only) printing capacity / stopped-task / target health.
   deploy-backend:
-    needs: [build-and-push-backend]
+    needs: build-and-push-backend
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     # Deploys on every push to main; manual runs also deploy (from whatever ref
     # they were dispatched on) so a deploy can be triggered without merging first.
     if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: us-east-1
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
-      - name: Deploy backend service
+      - name: Update ECS service
         env:
-          ECS_CLUSTER: ecommerce-cluster
           ECS_SERVICE: backend-service
-          IMAGE: ${{ needs.build-and-push-backend.outputs.registry }}/ecommerce-backend:${{ github.sha }}
+          CONTAINER_NAME: backend
+          IMAGE: ${{ env.ECR_REGISTRY }}/ecommerce-backend:${{ github.sha }}
+          # Fail the job unless the task actually reaches steady state: "registered a
+          # new revision" is not the same as "the service is running it".
+          WAIT_FOR_STABLE: 1
         run: sh scripts/ecs-deploy.sh
 
+      # Only on failure, and only reads: prints cluster capacity, stopped-task
+      # reasons and ALB target health so the log says *why* nothing is running.
+      - name: Triage (read-only)
+        if: failure()
+        run: sh scripts/ecs-diagnose.sh backend-service
+
   deploy-frontend:
-    needs: [build-and-push-frontend]
+    needs: build-and-push-frontend
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-region: us-east-1
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
-      - name: Deploy frontend service
+      - name: Update ECS service
         env:
-          ECS_CLUSTER: ecommerce-cluster
           ECS_SERVICE: frontend-service
-          IMAGE: ${{ needs.build-and-push-frontend.outputs.registry }}/ecommerce-frontend:${{ github.sha }}
+          CONTAINER_NAME: frontend
+          IMAGE: ${{ env.ECR_REGISTRY }}/ecommerce-frontend:${{ github.sha }}
+          WAIT_FOR_STABLE: 1
         run: sh scripts/ecs-deploy.sh
+
+      - name: Triage (read-only)
+        if: failure()
+        run: sh scripts/ecs-diagnose.sh frontend-service

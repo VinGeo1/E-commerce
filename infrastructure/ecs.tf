@@ -122,16 +122,25 @@ resource "aws_launch_template" "ecs" {
     http_endpoint = "enabled"
   }
 
+  # The ECS-optimized AMI ships the agent installed and enabled, and its unit is
+  # ordered After=cloud-final.service - systemd starts it only AFTER this user-data
+  # script has exited. So the config written below is what the agent reads on its
+  # first start, and the instance joins $ECS_CLUSTER a few minutes after boot.
+  #
+  # Do NOT add `systemctl start/restart ecs` here: while this script runs,
+  # cloud-final is active, so a blocking start would wait for cloud-final, which
+  # waits for the command to return - the script hangs (the boot's final step
+  # never completes) and the agent never starts, i.e. the instance never joins
+  # the cluster.
   user_data = base64encode(<<-EOT
     #!/bin/bash
     set -euxo pipefail
     cat > /etc/ecs/ecs.config <<'CONF'
     ECS_CLUSTER=ecommerce-cluster
-    ECS_ENABLE_CONTAINER_METADATA=true
-    ECS_LOGLEVEL=info
     CONF
-    systemctl enable ecs
-    systemctl start ecs
+    # Non-blocking: make sure the agent unit will start at boot (it already is
+    # on the optimized AMI; this covers an AMI revision that does not).
+    systemctl enable ecs 2>/dev/null || systemctl enable amazon-ecs-agent 2>/dev/null || true
   EOT
   )
 }
@@ -152,6 +161,13 @@ resource "aws_autoscaling_group" "ecs" {
   # networking means the new task cannot bind :8080 until the old one stops.
   health_check_type         = "EC2"
   health_check_grace_period = 300
+
+  # The workers have no public IP: they reach the ECS API, ECR and CloudWatch
+  # Logs only through the NAT. Without this ordering the ASG could launch an
+  # instance before the private routes exist; the agent would boot with no
+  # egress and sit unregistered (it retries, but this avoids the "instance is
+  # running, cluster is empty" window).
+  depends_on = [aws_nat_gateway.nat, aws_route_table_association.private]
 
   launch_template {
     id      = aws_launch_template.ecs.id
@@ -175,6 +191,14 @@ resource "aws_autoscaling_group" "ecs" {
 # network_mode = "host" (no ENI per task on EC2) and explicit portMappings, so a
 # container's port is also the instance's port. That is why each service below is
 # allowed to stop the old task before starting the new one.
+#
+# Sizing: both tasks have to fit on ONE t3.micro, which registers ~957 MiB with ECS
+# (1 GiB minus what the kernel keeps). The task-level `memory` is what the scheduler
+# reserves at placement, so two tasks at 512 MiB each (1024 MiB) can never both be
+# placed - the second service sits at running=0 with "insufficient memory available".
+# 512 (JVM) + 128 (nginx) = 640 MiB leaves ~300 MiB for the ECS agent, dockerd and
+# the OS. The container `memory` is the cgroup hard limit; the backend gets the whole
+# reservation because a Spring Boot 3 JVM in 256 MiB is OOM-killed (exit 137).
 
 resource "aws_ecs_task_definition" "backend" {
   family                   = "backend"
@@ -188,7 +212,7 @@ resource "aws_ecs_task_definition" "backend" {
     name      = "backend"
     image     = var.backend_image
     cpu       = 256
-    memory    = 256
+    memory    = 512
     essential = true
 
     portMappings = [{
@@ -222,13 +246,13 @@ resource "aws_ecs_task_definition" "frontend" {
   requires_compatibilities = ["EC2"]
   execution_role_arn       = aws_iam_role.ecs_task.arn
   cpu                      = "256"
-  memory                   = "512"
+  memory                   = "128"
 
   container_definitions = jsonencode([{
     name      = "frontend"
     image     = var.frontend_image
     cpu       = 256
-    memory    = 256
+    memory    = 128
     essential = true
 
     portMappings = [{
@@ -264,10 +288,25 @@ resource "aws_ecs_service" "backend" {
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
 
+  # Spring Boot on a t3.micro takes 60-90 s before :8080 answers, and the target
+  # group then needs healthy_threshold x interval (60 s) to flip to healthy. With
+  # the default grace period of 0 ECS would stop a cold-starting task as "failed
+  # ELB health checks" and loop forever.
+  health_check_grace_period_seconds = 180
+
   load_balancer {
     target_group_arn = aws_lb_target_group.backend.arn
     container_name   = "backend"
     container_port   = 8080
+  }
+
+  # scripts/ecs-deploy.sh (CI) owns which task-definition revision is running.
+  # Without this, every unrelated `terraform apply` would detect the service's
+  # task_definition drifted from the revision Terraform registered and roll it
+  # back - on this single-worker, stop-then-start setup that is an avoidable
+  # outage. Terraform still updates everything else about the service.
+  lifecycle {
+    ignore_changes = [task_definition]
   }
 
   depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.ec2_ecs_service]
@@ -283,10 +322,17 @@ resource "aws_ecs_service" "frontend" {
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
 
+  # nginx is up in under a second; this only covers the target group's 2 x 30 s.
+  health_check_grace_period_seconds = 90
+
   load_balancer {
     target_group_arn = aws_lb_target_group.frontend.arn
     container_name   = "frontend"
     container_port   = 80
+  }
+
+  lifecycle {
+    ignore_changes = [task_definition]
   }
 
   depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.ec2_ecs_service]
